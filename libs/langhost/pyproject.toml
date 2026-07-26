@@ -47,7 +47,7 @@ dependencies = [
     "python-dotenv>=0.8.0",
     "pyfiglet>=1.0.0",
     "langgraph-cli>=0.4.0,<0.5",
-    "uvicorn[standard]>=0.30",
+    "uvicorn[standard]>=0.51.0",
     # Exact same version as this package / langgraph-runtime-pg (lockstep releases).
     "langgraph-runtime-pg==0.11.1",
 ]

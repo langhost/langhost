@@ -1120,7 +1120,7 @@ requires-dist = [
     { name = "langgraph-runtime-pg", editable = "libs/langgraph-runtime-pg" },
     { name = "pyfiglet", specifier = ">=1.0.0" },
     { name = "python-dotenv", specifier = ">=0.8.0" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
 ]
 
 [[package]]
