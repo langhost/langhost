@@ -49,7 +49,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "sqlalchemy[asyncio]>=2.0",
+    "sqlalchemy[asyncio]>=2.0.51",
     "asyncpg>=0.29",
     "redis>=5.0",
     "alembic>=1.14",

@@ -1079,7 +1079,7 @@ requires-dist = [
     { name = "orjson", specifier = ">=3.9" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
     { name = "redis", specifier = ">=5.0" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
     { name = "starlette", specifier = ">=0.37" },
     { name = "structlog", specifier = ">=24.0" },
 ]
