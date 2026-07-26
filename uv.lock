@@ -1077,7 +1077,7 @@ requires-dist = [
     { name = "langgraph-api", specifier = "==0.11.1" },
     { name = "langgraph-checkpoint-postgres", specifier = "==3.1.0" },
     { name = "orjson", specifier = ">=3.9" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
     { name = "redis", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "starlette", specifier = ">=0.37" },
