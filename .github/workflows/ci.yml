@@ -157,7 +157,7 @@ jobs:
       - name: Install upstream SDK + suite deps
         # Editable local path may require a build; pinned wheels use --no-build.
         run: |
-          uv pip install --no-build -e .tests/langgraph_api/libs/sdk-py
+          UV_NO_BUILD=0 uv pip install -e .tests/langgraph_api/libs/sdk-py
           uv pip install --no-build "deepagents==0.6.12" "langchain==1.3.14"
 
       - name: First-party unit/queue tests
