@@ -7,7 +7,7 @@ import os
 import pathlib
 import sys
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import click
 from dotenv import load_dotenv
@@ -348,7 +348,7 @@ def serve(
     includes: Sequence[str] | None = list(reload_includes) or None
     excludes: Sequence[str] | None = list(reload_excludes) or None
     uvicorn_kwargs = _build_uvicorn_kwargs(workers)
-    http_cfg, mount_prefix = _resolve_mount_prefix(config_json)
+    http_cfg, mount_prefix = _resolve_mount_prefix(cast(dict[str, Any], config_json))
 
     port = _resolve_port(host, port)
     welcome = _langhost_welcome(

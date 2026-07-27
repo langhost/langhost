@@ -1792,9 +1792,9 @@ class Threads(Authenticated):
             try:
                 await checkpointer.aprune(list(thread_ids), strategy=strategy)
             except (
-                NotImplementedError,
+                NotImplementedError,  # NOSONAR - explicit 422 mapping for both
                 RuntimeError,
-            ) as exc:  # NOSONAR - explicit 422 mapping for both
+            ) as exc:
                 raise HTTPException(
                     status_code=422,
                     detail="keep_latest strategy is not supported by this checkpointer",

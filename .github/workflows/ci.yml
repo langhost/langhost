@@ -140,7 +140,7 @@ jobs:
       - name: Resolve upstream SDK ref
         id: upstream
         run: |
-          SDK_VERSION="$(uv run --no-build python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))')"
+          SDK_VERSION="$(.venv/bin/python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))')"
           echo "ref=sdk==${SDK_VERSION}" >> "$GITHUB_OUTPUT"
           echo "langgraph-sdk=${SDK_VERSION} → sdk==${SDK_VERSION}"
 
