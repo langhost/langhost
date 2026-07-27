@@ -138,7 +138,9 @@ def _build_asyncpg_ssl_connect_arg(ssl: dict[str, str | None]) -> Any | None:
     # Same semantics as pre-Sonar code: verified defaults, but sslmode=require
     # still encrypts without CA/hostname verification (libpq parity).
     ctx = (
-        ssl_module.create_default_context(cafile=sslrootcert)  # NOSONAR - intentional libpq require parity
+        ssl_module.create_default_context(
+            cafile=sslrootcert
+        )  # NOSONAR - intentional libpq require parity
         if sslrootcert
         else ssl_module.create_default_context()  # NOSONAR - intentional libpq require parity
     )

@@ -140,7 +140,7 @@ jobs:
       - name: Resolve upstream SDK ref
         id: upstream
         run: |
-          SDK_VERSION="$(uv run python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))')"  # NOSONAR
+          SDK_VERSION="$(uv run --no-build python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))')"
           echo "ref=sdk==${SDK_VERSION}" >> "$GITHUB_OUTPUT"
           echo "langgraph-sdk=${SDK_VERSION} → sdk==${SDK_VERSION}"
 
@@ -157,7 +157,7 @@ jobs:
       - name: Install upstream SDK + suite deps
         # Editable local path may require a build; pinned wheels use --no-build.
         run: |
-          UV_NO_BUILD=0 uv pip install -e .tests/langgraph_api/libs/sdk-py
+          uv pip install --no-build -e .tests/langgraph_api/libs/sdk-py
           uv pip install --no-build "deepagents==0.6.12" "langchain==1.3.14"
 
       - name: First-party unit/queue tests
