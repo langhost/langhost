@@ -27,6 +27,23 @@
   — it keeps this 100% open-source effort alive.</em>
 </p>
 
+<p align="center">
+  <a href="https://langhost.github.io/langhost/demo/">
+    <img
+      src="https://cdn.jsdelivr.net/gh/langhost/langhost@main/docs/assets/langhost-quickstart.svg"
+      alt="langhost quick start — from uv add to a live Agent Server (click for interactive player)"
+      width="820"
+    />
+  </a>
+</p>
+
+<p align="center">
+  <sub>
+    From <code>uv add langhost</code> to a live Agent Server — same SDK, same Studio, your Postgres + Redis.
+    <a href="https://langhost.github.io/langhost/demo/">Click the demo</a> to pause / seek.
+  </sub>
+</p>
+
 ---
 
 **langhost** is the open way to run a production-grade [LangGraph Agent Server](https://docs.langchain.com/langsmith/agent-server) on **your** Postgres and Redis — no closed runtime, no license key for persistence.

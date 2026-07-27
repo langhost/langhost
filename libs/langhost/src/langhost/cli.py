@@ -63,6 +63,7 @@ def _langhost_welcome(
     studio_url = f"{origin}/studio/?baseUrl={api_url}"
     agent_chat_url = f"https://agentchat.vercel.app/?apiUrl={api_url}&assistantId=agent"
     title = figlet_format("langhost", font="standard").rstrip()
+    repo_url = "https://github.com/langhost/langhost"
     return f"""
 
 {title}
@@ -71,6 +72,9 @@ def _langhost_welcome(
 - 🎨 Studio UI: \033[36m{studio_url}\033[0m
 - 📚 API Docs: \033[36m{api_url}/docs\033[0m
 - 💬 Agent Chat UI: \033[36m{agent_chat_url}\033[0m
+
+\033[1;33m★\033[0m  If langhost helps you, a GitHub star keeps the project alive:
+   \033[1;33m{repo_url}\033[0m
 
 Self-hosted, production-grade LangGraph Agent Server (Postgres + Redis).
 langhost {__version__}
