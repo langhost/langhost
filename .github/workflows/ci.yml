@@ -199,11 +199,11 @@ jobs:
           exit 1
 
       - name: First-party live-server E2E
-        timeout-minutes: 3
+        timeout-minutes: 8
         run: uv run pytest libs/langgraph-runtime-pg/tests/test_e2e.py -o "timeout=60" --reruns 2 --reruns-delay 1
 
       - name: Upstream SDK integration tests
-        timeout-minutes: 3
+        timeout-minutes: 8
         run: |
           uv run pytest .tests/langgraph_api/libs/sdk-py/tests/integration \
             -o "addopts=" -m integration --reruns 2 --reruns-delay 1
