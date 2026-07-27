@@ -90,11 +90,79 @@ class _ReplaceWelcomeBanner(logging.Filter):
         self._welcome = welcome
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if _UPSTREAM_WELCOME_MARKER not in record.getMessage():
-            return True
-        record.msg = self._welcome
-        record.args = ()
-        return True
+        if _UPSTREAM_WELCOME_MARKER in record.getMessage():
+            record.msg = self._welcome
+            record.args = ()
+        return (
+            True  # NOSONAR — logging.Filter keeps all records; we only rewrite the welcome banner
+        )
+
+
+def _validate_serve_options(
+    reload: bool,
+    workers: int,
+    ssl_certfile: pathlib.Path | None,
+    ssl_keyfile: pathlib.Path | None,
+    tunnel: bool,
+    wait_for_client: bool,
+    debug_port: int | None,
+) -> None:
+    """Validate mutually exclusive CLI options, raising UsageError on conflicts."""
+    if reload and workers > 1:
+        raise click.UsageError("Cannot combine --reload with --workers > 1.")
+    if (ssl_certfile is None) != (ssl_keyfile is None):
+        raise click.UsageError("Both --ssl-certfile and --ssl-keyfile are required for HTTPS.")
+    if ssl_certfile and ssl_keyfile and tunnel:
+        raise click.UsageError("Cannot combine --tunnel with SSL options.")
+    if wait_for_client and debug_port is None:
+        raise click.UsageError("--wait-for-client requires --debug-port.")
+
+
+def _prepare_serve_env(
+    env_file: pathlib.Path | None,
+    database_uri: str | None,
+    redis_uri: str | None,
+    n_jobs_per_worker: int | None,
+) -> tuple[str, str, int | None]:
+    """Load dotenv and resolve database/redis URIs. Returns (db_uri, redis_uri, n_jobs)."""
+    load_dotenv(env_file or ".env", override=False)
+    os.environ["LANGGRAPH_RUNTIME_EDITION"] = RUNTIME_EDITION
+
+    database_uri = database_uri or os.environ.get("DATABASE_URI")
+    redis_uri = redis_uri or os.environ.get("REDIS_URI")
+    if not database_uri:
+        raise click.UsageError(
+            "DATABASE_URI is required. Please set it in the environment or pass it to the command via --database-uri."
+        )
+    if not redis_uri:
+        raise click.UsageError(
+            "REDIS_URI is required. Please set it in the environment or pass it to the command via --redis-uri."
+        )
+    if n_jobs_per_worker is None:
+        raw = os.environ.get("N_JOBS_PER_WORKER")
+        if raw:
+            n_jobs_per_worker = int(raw)
+    return database_uri, redis_uri, n_jobs_per_worker
+
+
+def _build_uvicorn_kwargs(workers: int) -> dict[str, Any]:
+    """Build extra kwargs passed to uvicorn."""
+    uvicorn_kwargs: dict[str, Any] = {}
+    if workers > 1:
+        uvicorn_kwargs["workers"] = workers
+    return uvicorn_kwargs
+
+
+def _resolve_mount_prefix(config_json: dict[str, Any]) -> tuple[dict | None, str | None]:
+    """Extract http config and resolve mount prefix from config/env."""
+    http_cfg = config_json.get("http")
+    mount_prefix = None
+    if isinstance(http_cfg, dict):
+        mount_prefix = http_cfg.get("mount_prefix")
+    mount_prefix = (
+        os.environ.get("MOUNT_PREFIX") or os.environ.get("LANGGRAPH_MOUNT_PREFIX") or mount_prefix
+    )
+    return http_cfg, mount_prefix
 
 
 @click.group()
@@ -235,8 +303,8 @@ def cli() -> None:
     help="TLS private key file (serve over HTTPS).",
 )
 def serve(
-    host: str,
-    port: int,
+    host: str,  # NOSONAR - Click command signature intentionally wide
+    port: int,  # NOSONAR - Click command signature intentionally wide
     config: pathlib.Path,
     env_file: pathlib.Path | None,
     database_uri: str | None,
@@ -256,32 +324,13 @@ def serve(
     ssl_certfile: pathlib.Path | None,
     ssl_keyfile: pathlib.Path | None,
 ) -> None:
-    if reload and workers > 1:
-        raise click.UsageError("Cannot combine --reload with --workers > 1.")
-    if (ssl_certfile is None) != (ssl_keyfile is None):
-        raise click.UsageError("Both --ssl-certfile and --ssl-keyfile are required for HTTPS.")
-    if ssl_certfile and ssl_keyfile and tunnel:
-        raise click.UsageError("Cannot combine --tunnel with SSL options.")
-    if wait_for_client and debug_port is None:
-        raise click.UsageError("--wait-for-client requires --debug-port.")
+    _validate_serve_options(
+        reload, workers, ssl_certfile, ssl_keyfile, tunnel, wait_for_client, debug_port
+    )
 
-    load_dotenv(env_file or ".env", override=False)
-    os.environ["LANGGRAPH_RUNTIME_EDITION"] = RUNTIME_EDITION
-
-    database_uri = database_uri or os.environ.get("DATABASE_URI")
-    redis_uri = redis_uri or os.environ.get("REDIS_URI")
-    if not database_uri:
-        raise click.UsageError(
-            "DATABASE_URI is required. Please set it in the environment or pass it to the command via --database-uri."
-        )
-    if not redis_uri:
-        raise click.UsageError(
-            "REDIS_URI is required. Please set it in the environment or pass it to the command via --redis-uri."
-        )
-    if n_jobs_per_worker is None:
-        raw = os.environ.get("N_JOBS_PER_WORKER")
-        if raw:
-            n_jobs_per_worker = int(raw)
+    database_uri, redis_uri, n_jobs_per_worker = _prepare_serve_env(
+        env_file, database_uri, redis_uri, n_jobs_per_worker
+    )
 
     config_json = validate_config_file(config)
     if config_json.get("node_version"):
@@ -298,17 +347,8 @@ def serve(
 
     includes: Sequence[str] | None = list(reload_includes) or None
     excludes: Sequence[str] | None = list(reload_excludes) or None
-    uvicorn_kwargs: dict[str, Any] = {}
-    if workers > 1:
-        uvicorn_kwargs["workers"] = workers
-
-    http_cfg = config_json.get("http")
-    mount_prefix = None
-    if isinstance(http_cfg, dict):
-        mount_prefix = http_cfg.get("mount_prefix")
-    mount_prefix = (
-        os.environ.get("MOUNT_PREFIX") or os.environ.get("LANGGRAPH_MOUNT_PREFIX") or mount_prefix
-    )
+    uvicorn_kwargs = _build_uvicorn_kwargs(workers)
+    http_cfg, mount_prefix = _resolve_mount_prefix(config_json)
 
     port = _resolve_port(host, port)
     welcome = _langhost_welcome(

@@ -70,8 +70,14 @@ async def teardown_checkpointer() -> None:
             pass
 
 
-def Checkpointer(*args: Any, unpack_hook: Any = None, **kwargs: Any) -> AsyncPostgresSaver:
-    """Return the process-wide AsyncPostgresSaver (requires setup_checkpointer)."""
+def Checkpointer(  # NOSONAR - upstream factory name is PascalCase
+    *_args: Any, unpack_hook: Any = None, **_kwargs: Any
+) -> AsyncPostgresSaver:
+    """Return the process-wide AsyncPostgresSaver (requires setup_checkpointer).
+
+    Name matches the upstream ``langgraph_runtime`` factory API (PascalCase).
+    """
+    del unpack_hook  # accepted for API parity with upstream; unused here
     if _CHECKPOINTER is None:
         raise RuntimeError(
             "Checkpointer not initialized; call start_pool()/setup_checkpointer() first "

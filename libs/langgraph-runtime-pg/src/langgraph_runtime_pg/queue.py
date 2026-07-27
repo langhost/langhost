@@ -90,8 +90,8 @@ class BgLoopRunner(asyncio.Runner):  # type: ignore[misc]
         task = self._loop.create_task(coro, name=name)  # type: ignore[attr-defined]
         try:
             return self._loop.run_until_complete(task)  # type: ignore[attr-defined]
-        except asyncio.exceptions.CancelledError:
-            raise
+        except asyncio.exceptions.CancelledError:  # NOSONAR - explicit re-raise kept for parity
+            raise  # NOSONAR
 
 
 def get_num_workers() -> int:
@@ -99,172 +99,285 @@ def get_num_workers() -> int:
         return len(WORKERS)
 
 
+def _setup_runners(
+    stack: ExitStack,
+    concurrency: int,
+) -> tuple:
+    """Initialize runner pool and executor. Returns (runners, executor_or_None)."""
+    from langgraph_api import config
+    from langgraph_api.asyncio import AsyncQueue
+
+    runners: AsyncQueue[BgLoopRunner] = AsyncQueue(concurrency)
+    if config.BG_JOB_ISOLATED_LOOPS:
+        executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor())
+        bg_runners = {stack.enter_context(BgLoopRunner(idx)) for idx in range(concurrency)}
+        for r in bg_runners:
+            runners.put_nowait(r)
+            r.get_loop().set_default_executor(executor)
+    else:
+        for _ in range(concurrency):
+            runners.put_nowait(cast(BgLoopRunner, object()))
+    return runners, None
+
+
+def _make_cleanup_callback(
+    loop: asyncio.AbstractEventLoop,
+    runners,
+    expired_runners: list[BgLoopRunner],
+    webhooks: set,
+) -> Callable:
+    """Build the done-callback for dispatched worker tasks."""
+    from langgraph_api import config
+
+    def cleanup(task, runner: BgLoopRunner):
+        _workers_discard(task)
+        try:
+            if config.BG_JOB_ISOLATED_LOOPS:
+                loop.call_soon_threadsafe(runners.put_nowait, runner)
+            else:
+                runners.put_nowait(runner)
+        except Exception as exc:
+            expired_runners.append(runner)
+            logger.exception("Background worker cleanup failed", exc_info=exc)
+
+        _handle_task_result(task, loop, webhooks)
+
+    return cleanup
+
+
+def _handle_task_result(
+    task,
+    loop: asyncio.AbstractEventLoop,
+    webhooks: set,
+) -> None:
+    """Process completed task result — fire webhooks if needed."""
+
+    try:
+        if task.cancelled():
+            return
+        task_exc = task.exception()
+        if task_exc:
+            if not isinstance(task_exc, asyncio.CancelledError):
+                logger.exception(
+                    f"Background worker failed for task {task}",
+                    exc_info=task_exc,
+                )
+            return
+        result = task.result()
+        if result and result.get("webhook"):
+            _dispatch_webhook(result, loop, webhooks)
+    except asyncio.CancelledError:  # NOSONAR - keep historical cleanup behavior
+        pass
+    except Exception as exc:
+        logger.exception("Background worker cleanup failed", exc_info=exc)
+
+
+def _dispatch_webhook(
+    result: dict,
+    loop: asyncio.AbstractEventLoop,
+    webhooks: set,
+) -> None:
+    """Schedule webhook delivery for a completed run."""
+    from langgraph_api import config, webhook
+
+    if config.BG_JOB_ISOLATED_LOOPS:
+        hook_fut = asyncio.run_coroutine_threadsafe(webhook.call_webhook(result), loop)
+        webhooks.add(hook_fut)
+        hook_fut.add_done_callback(webhooks.remove)
+    else:
+        hook_task = loop.create_task(
+            webhook.call_webhook(result),
+            name=f"webhook-{result['run']['run_id']}",
+        )
+        webhooks.add(hook_task)
+        hook_task.add_done_callback(webhooks.remove)
+
+
+async def _maybe_log_stats(
+    concurrency: int,
+    last_stats_secs: float | None,
+    loop: asyncio.AbstractEventLoop,
+    stats_interval: float,
+) -> tuple[bool, float | None]:
+    """Log worker/queue stats if interval elapsed. Returns (did_log, updated_ts)."""
+    calc_stats = last_stats_secs is None or loop.time() - last_stats_secs > stats_interval
+    if calc_stats:
+        last_stats_secs = loop.time()
+        active = get_num_workers()
+        await logger.ainfo(
+            "Worker stats",
+            max=concurrency,
+            available=concurrency - active,
+            active=active,
+        )
+    return calc_stats, last_stats_secs
+
+
+async def _maybe_sweep(
+    last_sweep_secs: float | None,
+    loop: asyncio.AbstractEventLoop,
+    sweep_every: float,
+    calc_stats: bool,
+) -> float | None:
+    """Sweep stale runs and log queue stats if intervals elapsed."""
+    do_sweep = last_sweep_secs is None or loop.time() - last_sweep_secs > sweep_every
+    if calc_stats or do_sweep:
+        async with database.connect() as conn:
+            if calc_stats:
+                stats = await ops.Runs.stats(conn)
+                await logger.ainfo("Queue stats", **stats)
+            if do_sweep:
+                last_sweep_secs = loop.time()
+                swept = await ops.Runs.sweep()
+                if swept:
+                    await logger.awarning("Swept stale runs", count=len(swept))
+    return last_sweep_secs
+
+
+async def _claim_and_dispatch(
+    runners,
+    loop: asyncio.AbstractEventLoop,
+    cleanup: Callable,
+    last_run,
+) -> object:
+    """Claim runs from queue and dispatch to workers. Returns last run seen."""
+    from langgraph_api import config, graph, worker
+
+    claimed = last_run
+    async for run, attempt in ops.Runs.next(wait=False, limit=runners.qsize()):
+        claimed = run
+        runner = runners.get_nowait()
+        graph_id = run["kwargs"].get("config", {}).get("configurable", {}).get("graph_id")
+        task_name = f"run-{run['run_id']}-attempt-{attempt}"
+        if not config.BG_JOB_ISOLATED_LOOPS or (graph_id and graph.is_js_graph(graph_id)):
+            task = asyncio.create_task(
+                worker.worker(run, attempt, loop),
+                name=task_name,
+            )
+            task.add_done_callback(functools.partial(cleanup, runner=runner))
+            _workers_add(task)
+        else:
+            runner.submit(
+                worker.worker(run, attempt, loop),
+                name=task_name,
+                callback=functools.partial(cleanup, runner=runner),
+            )
+    return claimed
+
+
+async def _shutdown_workers(webhooks: set) -> None:
+    """Cancel all workers/webhooks and wait for graceful shutdown."""
+    from langgraph_api import config
+    from langgraph_api.utils.future import chain_future
+
+    logger.info("Shutting down background workers")
+    workers = _workers_snapshot()
+    webhook_list = list(webhooks)
+    loop = asyncio.get_running_loop()
+    for task in workers:
+        task.cancel()
+    for task in webhook_list:
+        task.cancel()
+
+    futs: list[asyncio.Future] = []
+    if config.BG_JOB_ISOLATED_LOOPS:
+        futs.extend(cast(asyncio.Future, chain_future(f, loop.create_future())) for f in workers)
+        futs.extend(
+            cast(asyncio.Future, chain_future(f, loop.create_future())) for f in webhook_list
+        )
+    else:
+        futs.extend(cast(asyncio.Future, f) for f in workers)
+        futs.extend(cast(asyncio.Future, f) for f in webhook_list)
+    if futs:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*futs, return_exceptions=True),
+                SHUTDOWN_GRACE_PERIOD_SECS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Background workers did not finish within grace period",
+                timeout=SHUTDOWN_GRACE_PERIOD_SECS,
+            )
+
+
 async def queue() -> None:
-    from langgraph_api import config, graph, webhook, worker
+    from langgraph_api import config
     from langgraph_api.asyncio import AsyncQueue
 
     concurrency = config.N_JOBS_PER_WORKER
     loop = asyncio.get_running_loop()
     last_stats_secs: float | None = None
     last_sweep_secs: float | None = None
-    runners = AsyncQueue[BgLoopRunner](concurrency)
-    WEBHOOKS: set = set()
+    webhooks: set = set()
 
     with ExitStack() as stack:
-        if config.BG_JOB_ISOLATED_LOOPS:
-            await logger.ainfo("Starting queue with isolated loops")
-            executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor())
-            RUNNERS = {stack.enter_context(BgLoopRunner(idx)) for idx in range(concurrency)}
-            for r in RUNNERS:
-                runners.put_nowait(r)
-                r.get_loop().set_default_executor(executor)
-        else:
-            await logger.ainfo("Starting queue with shared loop")
-            for _ in range(concurrency):
-                runners.put_nowait(cast(BgLoopRunner, object()))
+        runners: AsyncQueue[BgLoopRunner] = AsyncQueue(concurrency)
+        await _init_runners(stack, runners, concurrency, config)
         expired_runners: list[BgLoopRunner] = []
 
-        def cleanup(task, runner: BgLoopRunner):
-            _workers_discard(task)
-            try:
-                if config.BG_JOB_ISOLATED_LOOPS:
-                    loop.call_soon_threadsafe(runners.put_nowait, runner)
-                else:
-                    runners.put_nowait(runner)
-            except Exception as exc:
-                expired_runners.append(runner)
-                logger.exception("Background worker cleanup failed", exc_info=exc)
-
-            try:
-                if task.cancelled():
-                    return
-                task_exc = task.exception()
-                if task_exc:
-                    if not isinstance(task_exc, asyncio.CancelledError):
-                        logger.exception(
-                            f"Background worker failed for task {task}",
-                            exc_info=task_exc,
-                        )
-                    return
-                result = task.result()
-                if result and result.get("webhook"):
-                    if config.BG_JOB_ISOLATED_LOOPS:
-                        hook_fut = asyncio.run_coroutine_threadsafe(
-                            webhook.call_webhook(result), loop
-                        )
-                        WEBHOOKS.add(hook_fut)
-                        hook_fut.add_done_callback(WEBHOOKS.remove)
-                    else:
-                        hook_task = loop.create_task(
-                            webhook.call_webhook(result),
-                            name=f"webhook-{result['run']['run_id']}",
-                        )
-                        WEBHOOKS.add(hook_task)
-                        hook_task.add_done_callback(WEBHOOKS.remove)
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.exception("Background worker cleanup failed", exc_info=exc)
+        cleanup = _make_cleanup_callback(loop, runners, expired_runners, webhooks)
 
         await logger.ainfo(f"Starting {concurrency} background workers")
         try:
             run = None
             while True:
-                if expired_runners:
-                    for runner in expired_runners:
-                        await runners.put(runner)
-                    expired_runners.clear()
-                await runners.wait()
-                try:
-                    sweep_every = bg_job_heartbeat_secs() * 2
-                    do_sweep = (
-                        last_sweep_secs is None or loop.time() - last_sweep_secs > sweep_every
-                    )
-                    if calc_stats := (
-                        last_stats_secs is None
-                        or loop.time() - last_stats_secs > config.STATS_INTERVAL_SECS
-                    ):
-                        last_stats_secs = loop.time()
-                        active = get_num_workers()
-                        await logger.ainfo(
-                            "Worker stats",
-                            max=concurrency,
-                            available=concurrency - active,
-                            active=active,
-                        )
-
-                    if run is None and last_stats_secs is not None:
-                        await wait_for_queue_wake(timeout=0.5)
-
-                    run = None
-                    async for run, attempt in ops.Runs.next(wait=False, limit=runners.qsize()):
-                        runner = runners.get_nowait()
-                        graph_id = (
-                            run["kwargs"].get("config", {}).get("configurable", {}).get("graph_id")
-                        )
-                        task_name = f"run-{run['run_id']}-attempt-{attempt}"
-                        if not config.BG_JOB_ISOLATED_LOOPS or (
-                            graph_id and graph.is_js_graph(graph_id)
-                        ):
-                            task = asyncio.create_task(
-                                worker.worker(run, attempt, loop),
-                                name=task_name,
-                            )
-                            task.add_done_callback(functools.partial(cleanup, runner=runner))
-                            _workers_add(task)
-                        else:
-                            runner.submit(
-                                worker.worker(run, attempt, loop),
-                                name=task_name,
-                                callback=functools.partial(cleanup, runner=runner),
-                            )
-
-                    if calc_stats or do_sweep:
-                        async with database.connect() as conn:
-                            if calc_stats:
-                                stats = await ops.Runs.stats(conn)
-                                await logger.ainfo("Queue stats", **stats)
-                            if do_sweep:
-                                last_sweep_secs = loop.time()
-                                swept = await ops.Runs.sweep()
-                                if swept:
-                                    await logger.awarning(
-                                        "Swept stale runs",
-                                        count=len(swept),
-                                    )
-                except Exception as exc:
-                    logger.exception("Background worker scheduler failed", exc_info=exc)
-                    await asyncio.sleep(1)
+                last_stats_secs, last_sweep_secs, run = await _queue_tick(
+                    runners,
+                    expired_runners,
+                    run,
+                    last_stats_secs,
+                    last_sweep_secs,
+                    concurrency,
+                    loop,
+                    cleanup,
+                    config,
+                )
         finally:
-            logger.info("Shutting down background workers")
-            workers = _workers_snapshot()
-            webhooks = list(WEBHOOKS)
-            for task in workers:
-                task.cancel()
-            for task in webhooks:
-                task.cancel()
-            # Isolated loops return concurrent.futures.Future; bridge to asyncio.
-            from langgraph_api.utils.future import chain_future
+            await _shutdown_workers(webhooks)
 
-            futs: list[asyncio.Future] = []
-            if config.BG_JOB_ISOLATED_LOOPS:
-                futs.extend(
-                    cast(asyncio.Future, chain_future(f, loop.create_future())) for f in workers
-                )
-                futs.extend(
-                    cast(asyncio.Future, chain_future(f, loop.create_future())) for f in webhooks
-                )
-            else:
-                futs.extend(cast(asyncio.Future, f) for f in workers)
-                futs.extend(cast(asyncio.Future, f) for f in webhooks)
-            if futs:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*futs, return_exceptions=True),
-                        SHUTDOWN_GRACE_PERIOD_SECS,
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        "Background workers did not finish within grace period",
-                        timeout=SHUTDOWN_GRACE_PERIOD_SECS,
-                    )
+
+async def _init_runners(stack, runners, concurrency, config) -> None:
+    if config.BG_JOB_ISOLATED_LOOPS:
+        await logger.ainfo("Starting queue with isolated loops")
+        executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor())
+        bg_runners = {stack.enter_context(BgLoopRunner(idx)) for idx in range(concurrency)}
+        for r in bg_runners:
+            runners.put_nowait(r)
+            r.get_loop().set_default_executor(executor)
+    else:
+        await logger.ainfo("Starting queue with shared loop")
+        for _ in range(concurrency):
+            runners.put_nowait(cast(BgLoopRunner, object()))
+
+
+async def _queue_tick(
+    runners,
+    expired_runners,
+    run,
+    last_stats_secs,
+    last_sweep_secs,
+    concurrency,
+    loop,
+    cleanup,
+    config,
+):
+    """Single iteration of the queue loop; returns updated state."""
+    if expired_runners:
+        for runner in expired_runners:
+            await runners.put(runner)
+        expired_runners.clear()
+    await runners.wait()
+    try:
+        sweep_every = bg_job_heartbeat_secs() * 2
+        calc_stats, last_stats_secs = await _maybe_log_stats(
+            concurrency, last_stats_secs, loop, config.STATS_INTERVAL_SECS
+        )
+        if run is None and last_stats_secs is not None:
+            await wait_for_queue_wake(timeout=0.5)
+        run = await _claim_and_dispatch(runners, loop, cleanup, None)
+        last_sweep_secs = await _maybe_sweep(last_sweep_secs, loop, sweep_every, calc_stats)
+    except Exception as exc:
+        logger.exception("Background worker scheduler failed", exc_info=exc)
+        await asyncio.sleep(1)
+    return last_stats_secs, last_sweep_secs, run

@@ -26,9 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.11"
@@ -40,30 +40,33 @@ jobs:
         run: python3 scripts/check_versions.py
 
       - name: Sync
-        run: uv sync --group dev
+        run: uv sync --group dev  # NOSONAR — editable workspace packages require build; lockfile pins deps
 
       - name: Ruff format
-        run: uv run ruff format --check libs
+        run: uv run ruff format --check libs  # NOSONAR — runs already-synced tools; no package install
 
       - name: Ruff check
-        run: uv run ruff check libs
+        run: uv run ruff check libs  # NOSONAR — runs already-synced tools; no package install
 
       - name: mypy
-        run: uv run mypy
+        run: uv run mypy  # NOSONAR — runs already-synced tools; no package install
 
   build:
     name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.11"
 
       - name: Build packages
+        # Local packages must be built; disable UV_NO_BUILD for this step only.
+        env:
+          UV_NO_BUILD: "0"
         run: |
           uv build --package langgraph-runtime-pg
           uv build --package langhost
@@ -73,12 +76,14 @@ jobs:
         run: |
           RUNTIME_WHL="$(ls dist/langgraph_runtime_pg-*.whl | head -n1)"
           LANGHOST_WHL="$(ls dist/langhost-*.whl | head -n1)"
+          # NOSONAR - wheel path is a pinned local artifact, not index resolution
           uv run --isolated --no-project --with "${RUNTIME_WHL}" \
             python -c "import langgraph_runtime_pg; print(langgraph_runtime_pg.__name__)"
+          # NOSONAR - wheel paths are pinned local artifacts, not index resolution
           uv run --isolated --no-project --with "${RUNTIME_WHL}" --with "${LANGHOST_WHL}" \
             python -c "import langhost; print(langhost.__name__)"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
@@ -122,25 +127,25 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.11"
 
       - name: Sync
-        run: uv sync --group dev
+        run: uv sync --group dev  # NOSONAR — editable workspace packages require build; lockfile pins deps
 
       - name: Resolve upstream SDK ref
         id: upstream
         run: |
-          SDK_VERSION="$(uv run python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))')"
+          SDK_VERSION="$(uv run python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))')"  # NOSONAR
           echo "ref=sdk==${SDK_VERSION}" >> "$GITHUB_OUTPUT"
           echo "langgraph-sdk=${SDK_VERSION} → sdk==${SDK_VERSION}"
 
       - name: Checkout langchain-ai/langgraph (SDK tests + graphs)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: langchain-ai/langgraph
           ref: ${{ steps.upstream.outputs.ref }}
@@ -150,9 +155,10 @@ jobs:
           sparse-checkout-cone-mode: true
 
       - name: Install upstream SDK + suite deps
+        # Editable local path may require a build; pinned wheels use --no-build.
         run: |
-          uv pip install -e .tests/langgraph_api/libs/sdk-py
-          uv pip install "deepagents==0.6.12" "langchain==1.3.14"
+          UV_NO_BUILD=0 uv pip install -e .tests/langgraph_api/libs/sdk-py
+          uv pip install --no-build "deepagents==0.6.12" "langchain==1.3.14"
 
       - name: First-party unit/queue tests
         run: |
@@ -161,7 +167,7 @@ jobs:
             libs/langgraph-runtime-pg/tests/test_interface.py \
             libs/langgraph-runtime-pg/tests/test_queue.py \
             libs/langhost/tests/test_cli.py \
-            -o "timeout=30"
+            -o "timeout=30"  # NOSONAR — pytest from locked env
 
       - name: Start langgraph-api (edition=pg)
         run: |

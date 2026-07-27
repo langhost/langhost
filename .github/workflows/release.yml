@@ -9,13 +9,12 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
 jobs:
   # Full lint / build / e2e must pass before any upload.
   ci:
     name: CI
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yml
 
   build:
@@ -23,11 +22,13 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.11"
@@ -59,13 +60,15 @@ jobs:
         run: |
           RUNTIME_WHL="$(ls dist/langgraph_runtime_pg-*.whl | head -n1)"
           LANGHOST_WHL="$(ls dist/langhost-*.whl | head -n1)"
+          # Exact built wheel paths — no unlocked package names from an index.
+          # NOSONAR - wheel path is a pinned local artifact, not index resolution
           uv run --isolated --no-project --with "${RUNTIME_WHL}" \
             python -c "import langgraph_runtime_pg; print(langgraph_runtime_pg.__name__)"
+          # NOSONAR - wheel paths are pinned local artifacts, not index resolution
           uv run --isolated --no-project --with "${RUNTIME_WHL}" --with "${LANGHOST_WHL}" \
             python -c "import langhost; print(langhost.__name__)"
-
       - name: Upload dist
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
@@ -81,13 +84,13 @@ jobs:
       id-token: write # PyPI Trusted Publishing (OIDC)
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: dist
           path: dist
 
       # No checkout here — disable cache so post-setup does not fail the job.
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: false
           python-version: "3.11"
@@ -105,13 +108,13 @@ jobs:
       id-token: write # PyPI Trusted Publishing (OIDC)
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: dist
           path: dist
 
       # No checkout here — disable cache so post-setup does not fail the job.
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: false
           python-version: "3.11"
@@ -128,7 +131,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: dist
           path: dist

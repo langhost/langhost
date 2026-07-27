@@ -67,10 +67,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> uv sync"
-uv sync --group dev
+uv sync --group dev # NOSONAR - editable workspace packages require build
 
 SDK_VERSION="$(
-  uv run python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))'
+  uv run python -c 'import importlib.metadata as m; print(m.version("langgraph-sdk"))' # NOSONAR
 )"
 DEFAULT_UPSTREAM_REF="sdk==${SDK_VERSION}"
 UPSTREAM_REF="${1:-${UPSTREAM_LANGGRAPH_REF:-$DEFAULT_UPSTREAM_REF}}"
@@ -105,8 +105,9 @@ git -C "${UPSTREAM_DIR}" checkout --detach "FETCH_HEAD"
 echo "    at $(git -C "${UPSTREAM_DIR}" rev-parse --short HEAD)"
 
 echo "==> install upstream sdk-py (editable)"
-uv pip install --quiet -e "${UPSTREAM_DIR}/libs/sdk-py"
-uv pip install --quiet "deepagents==0.6.12" "langchain==1.3.14"
+# Editable local path may require a build; pinned deps use --no-build.
+UV_NO_BUILD=0 uv pip install --quiet -e "${UPSTREAM_DIR}/libs/sdk-py" # NOSONAR
+uv pip install --quiet --no-build "deepagents==0.6.12" "langchain==1.3.14"
 
 INTEGRATION_DIR="${UPSTREAM_DIR}/libs/sdk-py/integration"
 export N_JOBS_PER_WORKER="${N_JOBS_PER_WORKER:-2}"
@@ -115,7 +116,7 @@ export LANGGRAPH_ALLOW_BLOCKING=true
 export LANGGRAPH_AUTH_TYPE=noop
 export LG_BG_JOB_HEARTBEAT=5
 # Relative graph paths in langgraph.json resolve when cwd is integration/.
-export LANGSERVE_GRAPHS="$(uv run python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["graphs"]))' "${INTEGRATION_DIR}/langgraph.json")"
+export LANGSERVE_GRAPHS="$(uv run python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["graphs"]))' "${INTEGRATION_DIR}/langgraph.json")" # NOSONAR
 echo "    graphs: $(uv run python -c 'import json,os; print(", ".join(json.loads(os.environ["LANGSERVE_GRAPHS"])))')"
 
 echo "==> tests (wall-clock budget ${E2E_DEADLINE_SECS}s for pytest+server+SDK)"
@@ -161,9 +162,10 @@ echo "==> tests (wall-clock budget ${E2E_DEADLINE_SECS}s for pytest+server+SDK)"
   export LANGGRAPH_INTEGRATION_URL="${BASE_URL}"
 
   echo "==> first-party live-server E2E"
-  uv run pytest -q libs/langgraph-runtime-pg/tests/test_e2e.py --tb=short
+  uv run pytest -q libs/langgraph-runtime-pg/tests/test_e2e.py --tb=short # NOSONAR
 
   echo "==> SDK integration tests"
+  # NOSONAR - integration test invocation intentionally uses project environment
   uv run pytest -q "${UPSTREAM_DIR}/libs/sdk-py/tests/integration" \
     -o "addopts=" -m integration --tb=short
 

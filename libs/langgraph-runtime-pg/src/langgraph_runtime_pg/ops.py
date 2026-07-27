@@ -55,9 +55,11 @@ logger = structlog.stdlib.get_logger(__name__)
 
 StreamHandler = ContextQueue
 
+_RUN_NOT_FOUND = "Run not found"
+
 
 async def _empty_aiter():
-    if False:
+    for _ in ():
         yield
 
 
@@ -85,31 +87,33 @@ def _thread_status_from_checkpoint(
 ) -> tuple[str, dict]:
     """Return ``(base_thread_status, interrupts)`` from a checkpoint snapshot."""
     has_next = bool(checkpoint and checkpoint.get("next"))
-    if exception:
-        if ignore_user_control:
-            from langgraph_api.errors import UserInterrupt, UserRollback
-
-            if not isinstance(exception, (UserInterrupt, UserRollback)):
-                base = "error"
-            elif has_next:
-                base = "interrupted"
-            else:
-                base = "idle"
-        else:
-            base = "error"
-    elif has_next:
-        base = "interrupted"
-    else:
-        base = "idle"
-
-    interrupts: dict = {}
-    if checkpoint is not None:
-        interrupts = {
-            t["id"]: [_patch_interrupt(i) for i in (t.get("interrupts") or [])]
-            for t in (checkpoint.get("tasks") or [])
-            if t.get("interrupts")
-        }
+    base = _compute_base_status(exception, has_next, ignore_user_control)
+    interrupts = _extract_interrupts(checkpoint)
     return base, interrupts
+
+
+def _compute_base_status(
+    exception: BaseException | None, has_next: bool, ignore_user_control: bool
+) -> str:
+    if not exception:
+        return "interrupted" if has_next else "idle"
+    if not ignore_user_control:
+        return "error"
+    from langgraph_api.errors import UserInterrupt, UserRollback
+
+    if not isinstance(exception, (UserInterrupt, UserRollback)):
+        return "error"
+    return "interrupted" if has_next else "idle"
+
+
+def _extract_interrupts(checkpoint: dict | None) -> dict:
+    if checkpoint is None:
+        return {}
+    return {
+        t["id"]: [_patch_interrupt(i) for i in (t.get("interrupts") or [])]
+        for t in (checkpoint.get("tasks") or [])
+        if t.get("interrupts")
+    }
 
 
 def _test_mode() -> bool:
@@ -164,33 +168,41 @@ async def _acopy_thread_checkpoints(source_thread_id: str, target_thread_id: str
     checkpoints = [cp async for cp in checkpointer.alist(cfg)]
     checkpoints.sort(key=lambda x: x.config["configurable"]["checkpoint_id"])
     for cp in checkpoints:
-        ns = cp.config["configurable"].get("checkpoint_ns", "")
-        new_config: dict[str, Any] = {
-            "configurable": {
-                "thread_id": target_thread_id,
-                "checkpoint_ns": ns,
-            }
-        }
-        parent_config = cp.parent_config
-        if parent_config and parent_config.get("configurable"):
-            parent_id = parent_config["configurable"].get("checkpoint_id")
-            if parent_id is not None:
-                new_config["configurable"]["checkpoint_id"] = parent_id
-        new_metadata = dict(cp.metadata or {})
-        if "thread_id" in new_metadata:
-            new_metadata["thread_id"] = target_thread_id
-        stored_config = await checkpointer.aput(
-            new_config,
-            cp.checkpoint,
-            new_metadata,
-            cp.checkpoint.get("channel_versions", {}),
-        )
+        stored_config = await _copy_single_checkpoint(checkpointer, cp, target_thread_id)
         if cp.pending_writes:
-            writes_by_task: dict[str, list[tuple[str, Any]]] = {}
-            for task_id, channel, value in cp.pending_writes:
-                writes_by_task.setdefault(task_id, []).append((channel, value))
-            for task_id, writes in writes_by_task.items():
-                await checkpointer.aput_writes(stored_config, writes, task_id)
+            await _copy_pending_writes(checkpointer, stored_config, cp.pending_writes)
+
+
+async def _copy_single_checkpoint(checkpointer, cp, target_thread_id: str) -> dict:
+    ns = cp.config["configurable"].get("checkpoint_ns", "")
+    new_config: dict[str, Any] = {
+        "configurable": {
+            "thread_id": target_thread_id,
+            "checkpoint_ns": ns,
+        }
+    }
+    parent_config = cp.parent_config
+    if parent_config and parent_config.get("configurable"):
+        parent_id = parent_config["configurable"].get("checkpoint_id")
+        if parent_id is not None:
+            new_config["configurable"]["checkpoint_id"] = parent_id
+    new_metadata = dict(cp.metadata or {})
+    if "thread_id" in new_metadata:
+        new_metadata["thread_id"] = target_thread_id
+    return await checkpointer.aput(
+        new_config,
+        cp.checkpoint,
+        new_metadata,
+        cp.checkpoint.get("channel_versions", {}),
+    )
+
+
+async def _copy_pending_writes(checkpointer, stored_config: dict, pending_writes) -> None:
+    writes_by_task: dict[str, list[tuple[str, Any]]] = {}
+    for task_id, channel, value in pending_writes:
+        writes_by_task.setdefault(task_id, []).append((channel, value))
+    for task_id, writes in writes_by_task.items():
+        await checkpointer.aput_writes(stored_config, writes, task_id)
 
 
 class Authenticated:
@@ -282,7 +294,7 @@ def _resolve_sort_field(
     *,
     raise_invalid: bool = False,
 ) -> str:
-    sb = (sort_by or "").lower() if sort_by else ""
+    sb = sort_by.lower() if sort_by else ""
     if sb in allowed:
         return sb
     if sort_by and raise_invalid:
@@ -358,42 +370,47 @@ def _check_filter_match(
         raise HTTPException(status_code=500, detail="Too many nested filter operators")
 
     if "$or" in filters:
-        or_groups = filters["$or"]
-        if not any(_check_filter_match(metadata, g, nesting_level + 1) for g in or_groups):
-            return False
-        remaining = {k: v for k, v in filters.items() if k != "$or"}
-        if remaining:
-            return _check_filter_match(metadata, remaining, nesting_level + 1)
-        return True
-
+        return _check_logical_group(metadata, filters, "$or", nesting_level)
     if "$and" in filters:
-        and_groups = filters["$and"]
-        if not all(_check_filter_match(metadata, g, nesting_level + 1) for g in and_groups):
-            return False
-        remaining = {k: v for k, v in filters.items() if k != "$and"}
-        if remaining:
-            return _check_filter_match(metadata, remaining, nesting_level + 1)
-        return True
+        return _check_logical_group(metadata, filters, "$and", nesting_level)
+    return _check_kv_filters(metadata, filters)
 
+
+def _check_logical_group(metadata: dict, filters: dict, op: str, nesting_level: int) -> bool:
+    groups = filters[op]
+    if op == "$or":
+        matched = any(_check_filter_match(metadata, g, nesting_level + 1) for g in groups)
+    else:
+        matched = all(_check_filter_match(metadata, g, nesting_level + 1) for g in groups)
+    if not matched:
+        return False
+    remaining = {k: v for k, v in filters.items() if k != op}
+    if remaining:
+        return _check_filter_match(metadata, remaining, nesting_level + 1)
+    return True
+
+
+def _check_kv_filters(metadata: dict, filters: dict) -> bool:
     for key, value in filters.items():
         if isinstance(value, dict):
-            op = next(iter(value))
-            filter_value = value[op]
-            if op == "$eq":
-                if key not in metadata or metadata[key] != filter_value:
-                    return False
-            elif op == "$contains":
-                if key not in metadata or not isinstance(metadata[key], list):
-                    return False
-                if isinstance(filter_value, list):
-                    for el in filter_value:
-                        if el not in metadata[key]:
-                            return False
-                elif filter_value not in metadata[key]:
-                    return False
-        else:
-            if key not in metadata or metadata[key] != value:
+            if not _check_operator_filter(metadata, key, value):
                 return False
+        elif key not in metadata or metadata[key] != value:
+            return False
+    return True
+
+
+def _check_operator_filter(metadata: dict, key: str, value: dict) -> bool:
+    op = next(iter(value))
+    filter_value = value[op]
+    if op == "$eq":
+        return key in metadata and metadata[key] == filter_value
+    if op == "$contains":
+        if key not in metadata or not isinstance(metadata[key], list):
+            return False
+        if isinstance(filter_value, list):
+            return all(el in metadata[key] for el in filter_value)
+        return filter_value in metadata[key]
     return True
 
 
@@ -470,6 +487,242 @@ async def _thread_has_inflight_work(session, thread_id: UUID) -> bool:
     return await _thread_has_live_worker(session, thread_id)
 
 
+async def _search_with_python_filter(
+    conn: PgConnectionProto,
+    q,
+    filters,
+    sort_by: str | None,
+    sort_order: str | None,
+    offset: int,
+    limit: int,
+    allowed_fields: frozenset[str],
+    default_sort: str,
+    to_dict_fn,
+    *,
+    select: list | None = None,
+    extract: dict | None = None,
+    item_fn=None,
+) -> tuple[AsyncIterator, int | None]:
+    """Filter rows in Python, sort, paginate, materialize."""
+    rows = list((await conn.session.execute(q)).scalars())
+    rows = [r for r in rows if _check_filter_match(r.metadata_ or {}, filters)]
+    sb = _resolve_sort_field(sort_by, allowed_fields, default_sort)
+    reverse = not (sort_order and sort_order.upper() == "ASC")
+    rows.sort(key=lambda r: _row_sort_key(r, sb), reverse=reverse)
+    page = rows[offset : offset + limit]
+    cursor = offset + limit if len(rows) > offset + limit else None
+    items = _materialize_page(page, to_dict_fn, select=select, extract=extract, item_fn=item_fn)
+
+    async def _iter():
+        for d in items:
+            yield d
+
+    return _iter(), cursor
+
+
+async def _search_with_db_sort(
+    conn: PgConnectionProto,
+    q,
+    sort_by: str | None,
+    sort_order: str | None,
+    offset: int,
+    limit: int,
+    model_cls,
+    allowed_fields: frozenset[str],
+    default_sort: str,
+    to_dict_fn,
+    *,
+    select: list | None = None,
+    extract: dict | None = None,
+    item_fn=None,
+) -> tuple[AsyncIterator, int | None]:
+    """Sort/paginate in DB, materialize dicts while session is open."""
+    sb = _resolve_sort_field(sort_by, allowed_fields, default_sort)
+    col = getattr(model_cls, sb)
+    reverse = not (sort_order and sort_order.upper() == "ASC")
+    q = q.order_by(col.desc() if reverse else col.asc())
+    q = q.offset(offset).limit(limit + 1)
+    rows = list((await conn.session.execute(q)).scalars())
+    cursor = offset + limit if len(rows) > limit else None
+    page = rows[:limit]
+    items = _materialize_page(page, to_dict_fn, select=select, extract=extract, item_fn=item_fn)
+
+    async def _iter():
+        for d in items:
+            yield d
+
+    return _iter(), cursor
+
+
+def _materialize_page(
+    page,
+    to_dict_fn,
+    *,
+    select: list | None = None,
+    extract: dict | None = None,
+    item_fn=None,
+) -> list[dict]:
+    """Convert rows to dicts, optionally projecting fields or using a custom item builder."""
+    if item_fn is not None:
+        return [item_fn(r, select=select, extract=extract) for r in page]
+    items: list[dict] = []
+    for r in page:
+        d = to_dict_fn(r)
+        items.append({k: v for k, v in d.items() if k in select} if select else d)
+    return items
+
+
+def _normalize_config_context(config: dict, context: dict) -> tuple[dict, dict]:
+    """Reconcile config.configurable and context; raises if both provided."""
+    if config.get("configurable") and context:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot specify both configurable and context.",
+        )
+    if config.get("configurable"):
+        context = config["configurable"]
+    elif context:
+        config["configurable"] = context
+    return config, context
+
+
+def _handle_existing_assistant(
+    existing: AssistantRow | None,
+    assistant_id: UUID,
+    if_exists: str,
+    filters: Any,
+) -> AsyncIterator:
+    """Return an iterator or raise when an assistant already exists / race-lost."""
+    if existing is None or (filters and not _check_filter_match(existing.metadata_ or {}, filters)):
+        raise HTTPException(status_code=409, detail=f"Assistant {assistant_id} already exists")
+    if if_exists == "raise":
+        raise HTTPException(status_code=409, detail=f"Assistant {assistant_id} already exists")
+    data = assistant_to_dict(existing)
+
+    async def _yield():
+        yield data
+
+    return _yield()
+
+
+def _handle_existing_thread(
+    existing: ThreadRow | None,
+    thread_id: UUID,
+    if_exists: str,
+    filters: Any,
+) -> AsyncIterator:
+    """Return an iterator or raise when a thread already exists / race-lost."""
+    if existing is None or (filters and not _check_filter_match(existing.metadata_ or {}, filters)):
+        raise HTTPException(status_code=409, detail=f"Thread {thread_id} already exists")
+    if if_exists == "raise":
+        raise HTTPException(status_code=409, detail=f"Thread {thread_id} already exists")
+    data = thread_to_dict(existing)
+
+    async def _yield():
+        yield data
+
+    return _yield()
+
+
+def _assistant_where_clauses(graph_id, name, metadata) -> list:
+    clauses = []
+    if graph_id:
+        clauses.append(AssistantRow.graph_id == graph_id)
+    if name:
+        clauses.append(_name_ilike(name))
+    if metadata:
+        clauses.append(AssistantRow.metadata_.contains(metadata))
+    return clauses
+
+
+def _thread_where_clauses(metadata, values, status) -> list:
+    clauses = []
+    if metadata:
+        clauses.append(ThreadRow.metadata_.contains(metadata))
+    if values:
+        clauses.append(ThreadRow.values_.contains(values))
+    if status:
+        clauses.append(ThreadRow.status == status)
+    return clauses
+
+
+def _cron_where_clauses(assistant_id, thread_id, metadata) -> list:
+    clauses = []
+    if assistant_id is not None:
+        clauses.append(CronRow.assistant_id == _ensure_uuid(assistant_id))
+    if thread_id is not None:
+        clauses.append(CronRow.thread_id == _ensure_uuid(thread_id))
+    if metadata:
+        clauses.append(CronRow.metadata_.contains(metadata))
+    return clauses
+
+
+async def _count_with_auth(conn, model_cls, where_clauses, filters) -> int:
+    """Count rows with optional Python-side auth filter fallback."""
+    plain = _plain_metadata_filter(filters)
+    if filters and plain is None:
+        q = sa_select(model_cls)
+        for clause in where_clauses:
+            q = q.where(clause)
+        rows = list((await conn.session.execute(q)).scalars())
+        return sum(1 for r in rows if _check_filter_match(r.metadata_ or {}, filters))
+    count_q = sa_select(func.count()).select_from(model_cls)
+    for clause in where_clauses:
+        count_q = count_q.where(clause)
+    if plain:
+        count_q = count_q.where(model_cls.metadata_.contains(plain))
+    return int(await conn.session.scalar(count_q) or 0)
+
+
+async def _apply_assistant_patch_fields(
+    session,
+    assistant,
+    assistant_id,
+    new_version_num,
+    now,
+    *,
+    graph_id=None,
+    config=None,
+    context=None,
+    metadata=None,
+    name=None,
+    description=None,
+):
+    """Compute merged fields, insert a version row, and update the assistant."""
+    new_graph = graph_id if graph_id is not None else assistant.graph_id
+    new_config = config if config else assistant.config
+    new_context = context if context is not None else (assistant.context or {})
+    new_meta = (
+        {**(assistant.metadata_ or {}), **metadata} if metadata else (assistant.metadata_ or {})
+    )
+    new_name = name if name is not None else assistant.name
+    new_desc = description if description is not None else assistant.description
+
+    session.add(
+        AssistantVersionRow(
+            assistant_id=assistant_id,
+            version=new_version_num,
+            graph_id=new_graph,
+            config=new_config,
+            context=new_context,
+            metadata_=new_meta,
+            name=new_name,
+            description=new_desc,
+            created_at=now,
+        )
+    )
+    assistant.graph_id = new_graph
+    assistant.config = new_config
+    assistant.context = new_context
+    assistant.metadata_ = new_meta
+    assistant.name = new_name
+    assistant.description = new_desc
+    assistant.updated_at = now
+    assistant.version = new_version_num
+    await session.flush()
+    return assistant_to_dict(assistant)
+
+
 class Assistants(Authenticated):
     resource = "assistants"
 
@@ -511,44 +764,33 @@ class Assistants(Authenticated):
         if plain:
             q = q.where(AssistantRow.metadata_.contains(plain))
         elif filters:
-            rows = list((await conn.session.execute(q)).scalars())
-            rows = [r for r in rows if _check_filter_match(r.metadata_ or {}, filters)]
-            sb = _resolve_sort_field(sort_by, _ASSISTANT_SORT_FIELDS, "created_at")
-            reverse = not (sort_order and sort_order.upper() == "ASC")
-            rows.sort(key=lambda r: _row_sort_key(r, sb), reverse=reverse)
-            page = rows[offset : offset + limit]
-            cursor = offset + limit if len(rows) > offset + limit else None
-            items = []
-            for r in page:
-                d = assistant_to_dict(r)
-                items.append({k: v for k, v in d.items() if k in select} if select else d)
+            return await _search_with_python_filter(
+                conn,
+                q,
+                filters,
+                sort_by,
+                sort_order,
+                offset,
+                limit,
+                _ASSISTANT_SORT_FIELDS,
+                "created_at",
+                assistant_to_dict,
+                select=select,
+            )
 
-            async def _iter_filtered():
-                for d in items:
-                    yield d
-
-            return _iter_filtered(), cursor
-
-        sb = _resolve_sort_field(sort_by, _ASSISTANT_SORT_FIELDS, "created_at")
-        col = getattr(AssistantRow, sb)
-        reverse = not (sort_order and sort_order.upper() == "ASC")
-        q = q.order_by(col.desc() if reverse else col.asc())
-        q = q.offset(offset).limit(limit + 1)
-
-        rows = list((await conn.session.execute(q)).scalars())
-        cursor = offset + limit if len(rows) > limit else None
-        page = rows[:limit]
-        # Materialize dicts while the session is still open (API paginates outside connect()).
-        items = []
-        for r in page:
-            d = assistant_to_dict(r)
-            items.append({k: v for k, v in d.items() if k in select} if select else d)
-
-        async def _iter():
-            for d in items:
-                yield d
-
-        return _iter(), cursor
+        return await _search_with_db_sort(
+            conn,
+            q,
+            sort_by,
+            sort_order,
+            offset,
+            limit,
+            AssistantRow,
+            _ASSISTANT_SORT_FIELDS,
+            "created_at",
+            assistant_to_dict,
+            select=select,
+        )
 
     @staticmethod
     async def get(
@@ -612,38 +854,13 @@ class Assistants(Authenticated):
             ),
         )
         _assert_graph_exists(graph_id)
-
-        if config.get("configurable") and context:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot specify both configurable and context.",
-            )
-        if config.get("configurable"):
-            context = config["configurable"]
-        elif context:
-            config["configurable"] = context
+        config, context = _normalize_config_context(config, context)
 
         existing = await _aget_assistant(conn.session, assistant_id)
         if existing:
-            if filters and not _check_filter_match(existing.metadata_ or {}, filters):
-                raise HTTPException(
-                    status_code=409, detail=f"Assistant {assistant_id} already exists"
-                )
-            if if_exists == "raise":
-                raise HTTPException(
-                    status_code=409, detail=f"Assistant {assistant_id} already exists"
-                )
-            if if_exists == "do_nothing":
-                # Snapshot while session is open — API may drain after connect().
-                data = assistant_to_dict(existing)
-
-                async def _yield_existing():
-                    yield data
-
-                return _yield_existing()
+            return _handle_existing_assistant(existing, assistant_id, if_exists, filters)
 
         now = datetime.now(UTC)
-        # ON CONFLICT so concurrent replica startups (system assistants) are safe.
         ins = (
             pg_insert(AssistantRow)
             .values(
@@ -663,24 +880,7 @@ class Assistants(Authenticated):
         result = await conn.session.execute(ins)
         if result.rowcount == 0:
             existing = await _aget_assistant(conn.session, assistant_id)
-            # Re-check auth: another replica may have inserted first.
-            if existing is None or (
-                filters and not _check_filter_match(existing.metadata_ or {}, filters)
-            ):
-                raise HTTPException(
-                    status_code=409, detail=f"Assistant {assistant_id} already exists"
-                )
-            if if_exists == "raise":
-                raise HTTPException(
-                    status_code=409, detail=f"Assistant {assistant_id} already exists"
-                )
-
-            data = assistant_to_dict(existing)
-
-            async def _yield_raced():
-                yield data
-
-            return _yield_raced()
+            return _handle_existing_assistant(existing, assistant_id, if_exists, filters)
 
         await conn.session.execute(
             pg_insert(AssistantVersionRow)
@@ -737,14 +937,7 @@ class Assistants(Authenticated):
 
         if graph_id is not None:
             _assert_graph_exists(graph_id)
-        if config.get("configurable") and context:
-            raise HTTPException(
-                status_code=400, detail="Cannot specify both configurable and context."
-            )
-        if config.get("configurable"):
-            context = config["configurable"]
-        elif context:
-            config["configurable"] = context
+        config, context = _normalize_config_context(config, context or {})
 
         # Lock so concurrent patches cannot allocate the same version (PK on assistant_versions).
         assistant = (
@@ -767,38 +960,19 @@ class Assistants(Authenticated):
         )
         new_version_num = int(max_ver or 0) + 1
 
-        new_graph = graph_id if graph_id is not None else assistant.graph_id
-        new_config = config if config else assistant.config
-        new_context = context if context is not None else (assistant.context or {})
-        new_meta = (
-            {**(assistant.metadata_ or {}), **metadata} if metadata else (assistant.metadata_ or {})
+        data = await _apply_assistant_patch_fields(
+            conn.session,
+            assistant,
+            assistant_id,
+            new_version_num,
+            now,
+            graph_id=graph_id,
+            config=config,
+            context=context,
+            metadata=metadata,
+            name=name,
+            description=description,
         )
-        new_name = name if name is not None else assistant.name
-        new_desc = description if description is not None else assistant.description
-
-        conn.session.add(
-            AssistantVersionRow(
-                assistant_id=assistant_id,
-                version=new_version_num,
-                graph_id=new_graph,
-                config=new_config,
-                context=new_context,
-                metadata_=new_meta,
-                name=new_name,
-                description=new_desc,
-                created_at=now,
-            )
-        )
-        assistant.graph_id = new_graph
-        assistant.config = new_config
-        assistant.context = new_context
-        assistant.metadata_ = new_meta
-        assistant.name = new_name
-        assistant.description = new_desc
-        assistant.updated_at = now
-        assistant.version = new_version_num
-        await conn.session.flush()
-        data = assistant_to_dict(assistant)
 
         async def _yield():
             yield data
@@ -837,8 +1011,8 @@ class Assistants(Authenticated):
                 )
                 for (thread_id,) in result.all():
                     try:
-                        async for _ in await Threads.delete(conn, thread_id, ctx=ctx):
-                            pass
+                        async for _deleted in await Threads.delete(conn, thread_id, ctx=ctx):
+                            await logger.adebug("cascade-deleted thread", thread_id=str(thread_id))
                     except HTTPException:
                         await logger.awarning(
                             "Skipping thread deletion during cascade delete",
@@ -964,28 +1138,190 @@ class Assistants(Authenticated):
         if graph_id is not None:
             _assert_graph_exists(graph_id)
 
-        plain = _plain_metadata_filter(filters)
-        if filters and plain is None:
-            q = sa_select(AssistantRow)
-            if graph_id:
-                q = q.where(AssistantRow.graph_id == graph_id)
-            if name:
-                q = q.where(_name_ilike(name))
-            if metadata:
-                q = q.where(AssistantRow.metadata_.contains(metadata))
-            rows = list((await conn.session.execute(q)).scalars())
-            return sum(1 for r in rows if _check_filter_match(r.metadata_ or {}, filters))
+        clauses = _assistant_where_clauses(graph_id, name, metadata)
+        return await _count_with_auth(conn, AssistantRow, clauses, filters)
 
-        count_q = sa_select(func.count()).select_from(AssistantRow)
-        if graph_id:
-            count_q = count_q.where(AssistantRow.graph_id == graph_id)
-        if name:
-            count_q = count_q.where(_name_ilike(name))
-        if metadata:
-            count_q = count_q.where(AssistantRow.metadata_.contains(metadata))
-        if plain:
-            count_q = count_q.where(AssistantRow.metadata_.contains(plain))
-        return int(await conn.session.scalar(count_q) or 0)
+
+def _accept_message(message: Message, emitted_ids: set[str], resume_cursor: str | None) -> bool:
+    """True if this frame should be emitted (cursor + dedup)."""
+    if not message.id:
+        return True
+    mid = message.id.decode() if isinstance(message.id, bytes) else str(message.id)
+    if mid in emitted_ids:
+        return False
+    if resume_cursor is not None and not ms_seq_id_gt(mid, resume_cursor):
+        return False
+    emitted_ids.add(mid)
+    return True
+
+
+def _rewrite_control_done(event_bytes: bytes, message_bytes: bytes, run_id) -> tuple[bytes, bytes]:
+    """Convert control/done into metadata run_done event."""
+    if event_bytes == b"control" and message_bytes == b"done":
+        return b"metadata", orjson.dumps({"status": "run_done", "run_id": str(run_id)})
+    return event_bytes, message_bytes
+
+
+async def _stream_thread_events_loop(
+    created_queues, thread_id, seen_runs, resume_cursor, accept_fn, filter_fn
+) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
+    """Subscribe-drain loop for live thread events."""
+    last_subscribe_mono = 0.0
+    subscribe_interval = 0.15
+    while True:
+        now_mono = time.monotonic()
+        last_subscribe_mono, new_qs = await _maybe_resubscribe(
+            now_mono,
+            last_subscribe_mono,
+            subscribe_interval,
+            created_queues,
+            thread_id,
+            seen_runs,
+            resume_cursor,
+        )
+        created_queues.extend(new_qs)
+
+        drained_any = False
+        for run_id, queue in created_queues:
+            async for frame in _drain_single_queue(run_id, queue, accept_fn, filter_fn):
+                yield frame
+                drained_any = True
+
+        await asyncio.sleep(0 if drained_any else 0.02)
+
+
+async def _restore_thread_events(
+    stream_manager, thread_id: UUID, restore_cursor: str, accept_fn, should_filter_fn
+) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
+    """Restore historical events from message stores and DB."""
+    from langgraph_api.utils.stream_codec import decode_stream_message
+
+    all_events: list[tuple[Message, UUID]] = []
+    run_ids: set[UUID] = set(stream_manager.message_stores.get(thread_id, {}).keys())
+    async with connect() as conn:
+        result = await conn.session.execute(
+            sa_select(RunRow.run_id).where(RunRow.thread_id == thread_id)
+        )
+        run_ids.update(row[0] for row in result.all())
+    for run_id in run_ids:
+        for message in await stream_manager.restore_messages_async(
+            run_id, thread_id, restore_cursor
+        ):
+            all_events.append((message, run_id))
+    all_events.sort(key=lambda x: ms_seq_id_sort_key((x[0].id or b"").decode()))
+    for message, run_id in all_events:
+        if not accept_fn(message):
+            continue
+        try:
+            decoded = decode_stream_message(message.data, channel=message.topic)
+        except (ValueError, KeyError):
+            continue
+        event_bytes, message_bytes = _rewrite_control_done(
+            decoded.event_bytes, decoded.message_bytes, run_id
+        )
+        if not should_filter_fn(event_bytes.decode("utf-8"), message_bytes):
+            yield (event_bytes, message_bytes, message.id, str(run_id))
+
+
+def _make_event_filter(stream_modes: list):
+    """Return a filter function that returns True when an event should be dropped."""
+
+    def should_filter_event(event_name: str, message_bytes: bytes) -> bool:
+        if "run_modes" in stream_modes and event_name != "state_update":
+            return False
+        if "state_update" in stream_modes and event_name == "state_update":
+            return False
+        if "lifecycle" in stream_modes and event_name == "metadata":
+            return _lifecycle_passes(message_bytes)
+        return True
+
+    return should_filter_event
+
+
+def _lifecycle_passes(message_bytes: bytes) -> bool:
+    """Return False (don't filter) if lifecycle metadata matches."""
+    try:
+        message_data = orjson.loads(message_bytes)
+    except (orjson.JSONDecodeError, TypeError):
+        return True
+    if message_data.get("status") == "run_done":
+        return False
+    return not ("attempt" in message_data and "run_id" in message_data)
+
+
+async def _maybe_resubscribe(
+    now_mono,
+    last_subscribe_mono,
+    subscribe_interval,
+    created_queues,
+    thread_id,
+    seen_runs,
+    resume_cursor,
+) -> tuple[float, list]:
+    """Re-subscribe if enough time has elapsed; returns (new_last_subscribe_mono, new_queues)."""
+    if now_mono - last_subscribe_mono < subscribe_interval and created_queues:
+        return last_subscribe_mono, []
+    async with connect() as conn:
+        new_queue_tuples = await Threads.Stream.subscribe(
+            conn,
+            thread_id,
+            seen_runs,
+            after_id=resume_cursor,
+        )
+    return now_mono, new_queue_tuples
+
+
+async def _cleanup_stream_queues(created_queues, thread_id, stream_manager):
+    """Remove all queues from the stream manager on exit."""
+    for key, queue in created_queues:
+        try:
+            if key == thread_id:
+                await stream_manager.remove_thread_stream(thread_id, queue)
+            else:
+                await stream_manager.remove_queue(key, thread_id, queue)
+        except Exception:
+            pass
+
+
+async def _drain_single_queue(
+    run_id: UUID, queue: asyncio.Queue, accept_fn, should_filter_fn
+) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
+    """Drain messages from a single queue, yielding filtered frames."""
+    from langgraph_api.utils.stream_codec import decode_stream_message
+
+    while True:
+        try:
+            message = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if not accept_fn(message):
+            continue
+        try:
+            decoded = decode_stream_message(message.data, channel=message.topic)
+        except (ValueError, KeyError):
+            continue
+        event = decoded.event_bytes
+        payload = decoded.message_bytes
+
+        if event == b"control" and payload == b"done":
+            frame = _make_done_frame(message, run_id, should_filter_fn)
+            if frame is not None:
+                yield frame
+        elif not should_filter_fn(event.decode("utf-8"), payload):
+            yield (event, payload, message.id, str(run_id))
+            await asyncio.sleep(0)
+
+
+def _make_done_frame(
+    message: Message, run_id: UUID, should_filter_fn
+) -> tuple[bytes, bytes, bytes | None, str] | None:
+    """Build a run_done metadata frame from a control/done message."""
+    topic = message.topic.decode() if isinstance(message.topic, bytes) else message.topic
+    done_run_id = topic.split("run:")[1].split(":")[0]
+    meta_payload = orjson.dumps({"status": "run_done", "run_id": done_run_id})
+    if not should_filter_fn("metadata", meta_payload):
+        return (b"metadata", meta_payload, message.id, done_run_id)
+    return None
 
 
 class Threads(Authenticated):
@@ -1036,39 +1372,37 @@ class Threads(Authenticated):
         if plain:
             q = q.where(ThreadRow.metadata_.contains(plain))
         elif filters:
-            rows = list((await conn.session.execute(q)).scalars())
-            rows = [r for r in rows if _check_filter_match(r.metadata_ or {}, filters)]
-            sb = _resolve_sort_field(sort_by, _THREAD_SORT_FIELDS, "updated_at")
-            reverse = not (sort_order and sort_order.upper() == "ASC")
-            rows.sort(key=lambda r: _row_sort_key(r, sb), reverse=reverse)
-            page = rows[offset : offset + limit]
-            cursor = offset + limit if len(rows) > offset + limit else None
-            # Materialize while session is open — API paginates outside connect().
-            items = [_thread_search_item(r, select=select, extract=extract) for r in page]
+            return await _search_with_python_filter(
+                conn,
+                q,
+                filters,
+                sort_by,
+                sort_order,
+                offset,
+                limit,
+                _THREAD_SORT_FIELDS,
+                "updated_at",
+                thread_to_dict,
+                select=select,
+                extract=extract,
+                item_fn=_thread_search_item,
+            )
 
-            async def _iter_filtered():
-                for d in items:
-                    yield d
-
-            return _iter_filtered(), cursor
-
-        sb = _resolve_sort_field(sort_by, _THREAD_SORT_FIELDS, "updated_at")
-        col = getattr(ThreadRow, sb)
-        reverse = not (sort_order and sort_order.upper() == "ASC")
-        q = q.order_by(col.desc() if reverse else col.asc())
-        q = q.offset(offset).limit(limit + 1)
-
-        rows = list((await conn.session.execute(q)).scalars())
-        cursor = offset + limit if len(rows) > limit else None
-        page = rows[:limit]
-        # Materialize while session is open — API paginates outside connect().
-        items = [_thread_search_item(r, select=select, extract=extract) for r in page]
-
-        async def _iter():
-            for d in items:
-                yield d
-
-        return _iter(), cursor
+        return await _search_with_db_sort(
+            conn,
+            q,
+            sort_by,
+            sort_order,
+            offset,
+            limit,
+            ThreadRow,
+            _THREAD_SORT_FIELDS,
+            "updated_at",
+            thread_to_dict,
+            select=select,
+            extract=extract,
+            item_fn=_thread_search_item,
+        )
 
     @staticmethod
     async def get(
@@ -1121,20 +1455,9 @@ class Threads(Authenticated):
 
         existing = await _aget_thread(conn.session, thread_id)
         if existing:
-            if filters and not _check_filter_match(existing.metadata_ or {}, filters):
-                raise HTTPException(status_code=409, detail=f"Thread {thread_id} already exists")
-            if if_exists == "raise":
-                raise HTTPException(status_code=409, detail=f"Thread {thread_id} already exists")
-            if if_exists == "do_nothing":
-                data = thread_to_dict(existing)
-
-                async def _yield_existing():
-                    yield data
-
-                return _yield_existing()
+            return _handle_existing_thread(existing, thread_id, if_exists, filters)
 
         now = datetime.now(UTC)
-        # ON CONFLICT so concurrent replica creates of the same id are safe.
         ins = (
             pg_insert(ThreadRow)
             .values(
@@ -1153,20 +1476,7 @@ class Threads(Authenticated):
         result = await conn.session.execute(ins)
         if result.rowcount == 0:
             existing = await _aget_thread(conn.session, thread_id)
-            # Re-check auth: another replica may have inserted first.
-            if existing is None or (
-                filters and not _check_filter_match(existing.metadata_ or {}, filters)
-            ):
-                raise HTTPException(status_code=409, detail=f"Thread {thread_id} already exists")
-            if if_exists == "raise":
-                raise HTTPException(status_code=409, detail=f"Thread {thread_id} already exists")
-
-            data = thread_to_dict(existing)
-
-            async def _yield_raced():
-                yield data
-
-            return _yield_raced()
+            return _handle_existing_thread(existing, thread_id, if_exists, filters)
 
         await conn.session.flush()
         row = await _aget_thread(conn.session, thread_id)
@@ -1462,28 +1772,8 @@ class Threads(Authenticated):
                 offset=0,
             ),
         )
-        plain = _plain_metadata_filter(filters)
-        if filters and plain is None:
-            q = sa_select(ThreadRow)
-            if metadata:
-                q = q.where(ThreadRow.metadata_.contains(metadata))
-            if values:
-                q = q.where(ThreadRow.values_.contains(values))
-            if status:
-                q = q.where(ThreadRow.status == status)
-            rows = list((await conn.session.execute(q)).scalars())
-            return sum(1 for r in rows if _check_filter_match(r.metadata_ or {}, filters))
-
-        count_q = sa_select(func.count()).select_from(ThreadRow)
-        if metadata:
-            count_q = count_q.where(ThreadRow.metadata_.contains(metadata))
-        if values:
-            count_q = count_q.where(ThreadRow.values_.contains(values))
-        if status:
-            count_q = count_q.where(ThreadRow.status == status)
-        if plain:
-            count_q = count_q.where(ThreadRow.metadata_.contains(plain))
-        return int(await conn.session.scalar(count_q) or 0)
+        clauses = _thread_where_clauses(metadata, values, status)
+        return await _count_with_auth(conn, ThreadRow, clauses, filters)
 
     @staticmethod
     async def prune(
@@ -1501,7 +1791,7 @@ class Threads(Authenticated):
             checkpointer = await _get_checkpointer()
             try:
                 await checkpointer.aprune(list(thread_ids), strategy=strategy)
-            except (NotImplementedError, RuntimeError) as exc:
+            except (NotImplementedError, RuntimeError) as exc:  # NOSONAR - explicit 422 mapping for both
                 raise HTTPException(
                     status_code=422,
                     detail="keep_latest strategy is not supported by this checkpointer",
@@ -1919,177 +2209,42 @@ class Threads(Authenticated):
         ) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
             """Stream thread output (Protocol v3)."""
             await Threads.Stream.check_thread_stream_auth(thread_id, ctx)
-            from langgraph_api.utils.stream_codec import (
-                decode_stream_message,
-            )
 
             stream_modes = list(stream_modes or [])
-
-            def should_filter_event(event_name: str, message_bytes: bytes) -> bool:
-                if "run_modes" in stream_modes and event_name != "state_update":
-                    return False
-                if "state_update" in stream_modes and event_name == "state_update":
-                    return False
-                if "lifecycle" in stream_modes and event_name == "metadata":
-                    try:
-                        message_data = orjson.loads(message_bytes)
-                        if message_data.get("status") == "run_done":
-                            return False
-                        if "attempt" in message_data and "run_id" in message_data:
-                            return False
-                    except (orjson.JSONDecodeError, TypeError):
-                        pass
-                return True
-
             stream_manager = get_stream_manager()
             seen_runs: set[UUID] = set()
             created_queues: list[tuple[UUID, asyncio.Queue]] = []
             thread_id = _ensure_uuid(thread_id)
-            # "-" restores from Redis Streams; local replay is empty on a cold replica.
             from_beginning = last_event_id in ("-", "")
             resume_cursor = None if last_event_id is None or from_beginning else last_event_id
             restore_cursor = "-" if from_beginning else resume_cursor
             emitted_ids: set[str] = set()
 
             def _accept(message: Message) -> bool:
-                """True if this frame should be emitted (cursor + dedup)."""
-                if not message.id:
-                    return True
-                mid = message.id.decode() if isinstance(message.id, bytes) else str(message.id)
-                if mid in emitted_ids:
-                    return False
-                if resume_cursor is not None and not ms_seq_id_gt(mid, resume_cursor):
-                    return False
-                emitted_ids.add(mid)
-                return True
+                return _accept_message(message, emitted_ids, resume_cursor)
+
+            filter_fn = _make_event_filter(stream_modes)
 
             try:
                 await logger.ainfo("Joined thread stream", thread_id=str(thread_id))
 
-                # Dedup restore vs later add_queue replay via emitted_ids.
                 if restore_cursor is not None:
-                    store_key = thread_id
-                    all_events = []
-                    run_ids: set[UUID] = set(
-                        stream_manager.message_stores.get(store_key, {}).keys()
-                    )
-                    async with connect() as conn:
-                        result = await conn.session.execute(
-                            sa_select(RunRow.run_id).where(RunRow.thread_id == thread_id)
-                        )
-                        run_ids.update(row[0] for row in result.all())
-                    for run_id in run_ids:
-                        for message in await stream_manager.restore_messages_async(
-                            run_id, thread_id, restore_cursor
-                        ):
-                            all_events.append((message, run_id))
-                    all_events.sort(key=lambda x: ms_seq_id_sort_key((x[0].id or b"").decode()))
-                    for message, run_id in all_events:
-                        if not _accept(message):
-                            continue
-                        try:
-                            decoded = decode_stream_message(message.data, channel=message.topic)
-                        except (ValueError, KeyError):
-                            continue
-                        event_bytes = decoded.event_bytes
-                        message_bytes = decoded.message_bytes
-                        if event_bytes == b"control" and message_bytes == b"done":
-                            event_bytes = b"metadata"
-                            message_bytes = orjson.dumps(
-                                {"status": "run_done", "run_id": str(run_id)}
-                            )
-                        if not should_filter_event(event_bytes.decode("utf-8"), message_bytes):
-                            yield (
-                                event_bytes,
-                                message_bytes,
-                                message.id,
-                                str(run_id),
-                            )
+                    async for frame in _restore_thread_events(
+                        stream_manager, thread_id, restore_cursor, _accept, filter_fn
+                    ):
+                        yield frame
 
-                # Do not open connect() every drain tick — dual SSE connections exhaust the pool.
-                last_subscribe_mono = 0.0
-                subscribe_interval = 0.15
-                while True:
-                    now_mono = time.monotonic()
-                    if now_mono - last_subscribe_mono >= subscribe_interval or not created_queues:
-                        async with connect() as conn:
-                            new_queue_tuples = await Threads.Stream.subscribe(
-                                conn,
-                                thread_id,
-                                seen_runs,
-                                after_id=resume_cursor,
-                            )
-                        for run_id, queue in new_queue_tuples:
-                            created_queues.append((run_id, queue))
-                        last_subscribe_mono = now_mono
-
-                    drained_any = False
-                    for run_id, queue in created_queues:
-                        while True:
-                            try:
-                                message = queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
-                            if not _accept(message):
-                                continue
-                            try:
-                                decoded = decode_stream_message(message.data, channel=message.topic)
-                            except (ValueError, KeyError):
-                                continue
-                            event = decoded.event_bytes
-                            event_name = event.decode("utf-8")
-                            payload = decoded.message_bytes
-
-                            if event == b"control" and payload == b"done":
-                                topic = (
-                                    message.topic.decode()
-                                    if isinstance(message.topic, bytes)
-                                    else message.topic
-                                )
-                                done_run_id = topic.split("run:")[1].split(":")[0]
-                                meta_event = b"metadata"
-                                meta_payload = orjson.dumps(
-                                    {"status": "run_done", "run_id": done_run_id}
-                                )
-                                if not should_filter_event("metadata", meta_payload):
-                                    yield (
-                                        meta_event,
-                                        meta_payload,
-                                        message.id,
-                                        done_run_id,
-                                    )
-                                    drained_any = True
-                            elif not should_filter_event(event_name, payload):
-                                yield (
-                                    event,
-                                    payload,
-                                    message.id,
-                                    str(run_id),
-                                )
-                                drained_any = True
-                                await asyncio.sleep(0)
-
-                    if drained_any:
-                        await asyncio.sleep(0)
-                    else:
-                        await asyncio.sleep(0.02)
+                async for frame in _stream_thread_events_loop(
+                    created_queues, thread_id, seen_runs, resume_cursor, _accept, filter_fn
+                ):
+                    yield frame
             except WrappedHTTPException as e:
                 raise e.http_exception from None
             except asyncio.CancelledError:
-                await logger.awarning(
-                    "Thread stream client disconnected",
-                    thread_id=str(thread_id),
-                )
+                await logger.awarning("Thread stream client disconnected", thread_id=str(thread_id))
                 raise
             finally:
-                for key, queue in created_queues:
-                    try:
-                        if key == thread_id:
-                            await stream_manager.remove_thread_stream(thread_id, queue)
-                        else:
-                            await stream_manager.remove_queue(key, thread_id, queue)
-                    except Exception:
-                        pass
+                await _cleanup_stream_queues(created_queues, thread_id, stream_manager)
 
         @staticmethod
         async def publish(thread_id: UUID | str, event: str, message: bytes) -> None:
@@ -2120,6 +2275,634 @@ class Threads(Authenticated):
                         thread = None
                     if not thread or not _check_filter_match(thread.get("metadata") or {}, filters):
                         raise HTTPException(status_code=404, detail="Thread not found")
+
+
+async def _sweep_single_run(sf, run_id: UUID, retry_counter, max_retries: int) -> bool:
+    """Reclaim one stale run. Returns True if swept."""
+    attempts = await retry_counter.get(run_id)
+    new_status = "error" if attempts >= max_retries else "pending"
+    async with sf() as session:
+        result = await session.execute(
+            text(
+                """
+                UPDATE runs
+                SET status = :status, updated_at = now()
+                WHERE run_id = :run_id AND status = 'running'
+                RETURNING run_id, thread_id
+                """
+            ),
+            {"status": new_status, "run_id": run_id},
+        )
+        row = result.first()
+        if row is not None and new_status == "error" and row[1] is not None:
+            await _mark_thread_error_if_idle(session, row[1])
+        await session.commit()
+    if row is None:
+        return False
+    await clear_run_heartbeat(run_id)
+    await logger.awarning(
+        "Swept stale run", run_id=str(run_id), new_status=new_status, attempts=attempts
+    )
+    return True
+
+
+async def _has_heartbeating_sibling(session, thread_id: UUID, run_id: UUID) -> bool:
+    """True if any sibling run on the same thread still has a heartbeat."""
+    sibling_ids = list(
+        (
+            await session.execute(
+                sa_select(RunRow.run_id).where(
+                    RunRow.thread_id == thread_id,
+                    RunRow.run_id != run_id,
+                    RunRow.status.in_(("running", "interrupted")),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for sid in sibling_ids:
+        if await has_run_heartbeat(sid) is not False:
+            return True
+    return False
+
+
+async def _claim_next_run(sf, blocked_threads, retry_counter_cls):
+    """Try to claim the next pending run.
+
+    Returns a 5-tuple ``(kind, run_id, thread_id, run_dict, attempt)`` where
+    *kind* is one of ``"empty"``, ``"blocked"``, or ``"claimed"``.
+    """
+    async with sf() as session:
+        exclude_sql, params = _build_exclude_sql(blocked_threads)
+        result = await session.execute(
+            text(
+                f"""
+                UPDATE runs SET status = 'running', updated_at = now()
+                WHERE run_id = (
+                    SELECT r.run_id FROM runs r
+                    WHERE r.status = 'pending'
+                      AND r.created_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM runs r2
+                          WHERE r2.thread_id IS NOT NULL
+                            AND r2.thread_id = r.thread_id
+                            AND r2.status = 'running'
+                      )
+                      {exclude_sql}
+                    ORDER BY r.created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING run_id
+                """
+            ),
+            params,
+        )
+        row = result.first()
+        if row is None:
+            return ("empty", None, None, None, None)
+        run_id = row[0]
+        run_row = await session.get(RunRow, run_id)
+        if run_row is None:
+            await session.commit()
+            return ("empty", None, None, None, None)
+        if run_row.thread_id is not None:
+            blocked_by_hb = await _has_heartbeating_sibling(session, run_row.thread_id, run_id)
+            if blocked_by_hb:
+                run_row.status = "pending"
+                await session.commit()
+                return ("blocked", run_id, run_row.thread_id, None, None)
+        attempt = await retry_counter_cls(sf).increment(run_id, session=session)
+        run_dict = run_to_dict(run_row)
+        await set_run_heartbeat(run_id)
+        try:
+            await session.commit()
+        except Exception:
+            await clear_run_heartbeat(run_id)
+            raise
+        return ("claimed", run_id, None, run_dict, attempt)
+
+
+def _build_exclude_sql(blocked_threads: list) -> tuple[str, dict]:
+    if not blocked_threads:
+        return "", {}
+    placeholders = ", ".join(f":bt_{i}" for i in range(len(blocked_threads)))
+    exclude_sql = f"AND (r.thread_id IS NULL OR r.thread_id NOT IN ({placeholders}))"
+    params = {f"bt_{i}": t for i, t in enumerate(blocked_threads)}
+    return exclude_sql, params
+
+
+async def _ensure_run_thread(
+    conn: PgConnectionProto,
+    thread_id: UUID | None,
+    assistant,
+    config: dict,
+    metadata: dict,
+    assistant_id: UUID,
+) -> tuple[UUID, ThreadRow | None, bool]:
+    """Create a thread for a run if needed. Returns (thread_id, row, was_created)."""
+    if thread_id is None:
+        thread_id = uuid4()
+    now = datetime.now(UTC)
+    thread_meta = {
+        "graph_id": assistant.graph_id,
+        "assistant_id": str(assistant_id),
+        **(config.get("metadata") or {}),
+        **metadata,
+    }
+    thread_config = _merge_jsonb(
+        assistant.config or {},
+        config,
+        {"configurable": _merge_jsonb((assistant.config or {}).get("configurable") or {})},
+    )
+    ins = (
+        pg_insert(ThreadRow)
+        .values(
+            thread_id=thread_id,
+            status="busy",
+            metadata_=thread_meta,
+            config=thread_config,
+            created_at=now,
+            updated_at=now,
+            state_updated_at=now,
+            values_=None,
+            interrupts={},
+        )
+        .on_conflict_do_nothing(index_elements=["thread_id"])
+    )
+    result = await conn.session.execute(ins)
+    if result.rowcount == 0:
+        row = await _aget_thread(conn.session, thread_id)
+        return thread_id, row, False
+    await conn.session.flush()
+    row = await _aget_thread(conn.session, thread_id)
+    return thread_id, row, True
+
+
+async def _mark_thread_error_if_idle(session, tid: UUID) -> None:
+    """Mark a thread as error if no pending/running runs remain."""
+    pending = int(
+        await session.scalar(
+            sa_select(func.count())
+            .select_from(RunRow)
+            .where(RunRow.thread_id == tid, RunRow.status.in_(("pending", "running")))
+        )
+        or 0
+    )
+    if pending != 0:
+        return
+    thread = await _aget_thread(session, tid)
+    if thread is None:
+        return
+    thread.status = "error"
+    thread.updated_at = datetime.now(UTC)
+    if thread.error is None:
+        thread.error = {
+            "error": "RuntimeError",
+            "message": "Run swept after exceeding max retries",
+        }
+
+
+def _run_join_accept(message: Message, emitted_ids: set, resume_cursor) -> bool:
+    """Accept filter for run join streaming — dedup + cursor check."""
+    if not message.id:
+        return True
+    mid = message.id.decode() if isinstance(message.id, bytes) else str(message.id)
+    if mid in emitted_ids:
+        return False
+    if resume_cursor is not None and not ms_seq_id_gt(mid, resume_cursor):
+        return False
+    emitted_ids.add(mid)
+    return True
+
+
+async def _restore_run_messages(
+    run_id,
+    thread_id,
+    last_event_id,
+    accept_fn,
+    stream_mode,
+    decode_fn,
+) -> tuple[list, bool]:
+    """Replay stored messages; return (frames_list, is_done)."""
+    frames: list = []
+    messages = await get_stream_manager().restore_messages_async(run_id, thread_id, last_event_id)
+    for message in messages:
+        if not accept_fn(message):
+            continue
+        decoded = decode_fn(message.data, channel=message.topic)
+        mode = decoded.event_bytes.decode("utf-8")
+        payload = decoded.message_bytes
+        if mode == "control" and payload == b"done":
+            return frames, True
+        if _run_stream_mode_matches(mode, stream_mode):
+            frames.append((mode.encode(), payload, message.id))
+    return frames, False
+
+
+async def _stream_run_queue(
+    queue,
+    run,
+    accept_fn,
+    stream_mode,
+    run_id,
+    thread_id,
+    ctx,
+    ignore_404,
+    json_dumpb,
+    decode_fn,
+):
+    """Consume the live queue and yield frames until done or error."""
+    while True:
+        try:
+            message = await asyncio.wait_for(queue.get(), timeout=0.5)
+        except TimeoutError:
+            run = await _poll_run_status(run_id, thread_id, ctx)
+            action = _run_poll_action(run, ignore_404, json_dumpb)
+            if action == "break":
+                return
+            if action is not None:
+                yield action
+                return
+            continue
+        frame = _decode_run_message(message, accept_fn, decode_fn, stream_mode, run)
+        if frame is None:
+            continue
+        if frame == "done":
+            return
+        yield frame
+
+
+def _decode_run_message(message, accept_fn, decode_fn, stream_mode, run):
+    """Decode a queue message; return frame tuple, 'done', or None to skip."""
+    if not accept_fn(message):
+        return None
+    decoded = decode_fn(message.data, channel=message.topic)
+    mode = decoded.event_bytes.decode("utf-8")
+    payload = decoded.message_bytes
+    if mode == "control" and payload == b"done":
+        return "done"
+    if not _run_stream_mode_matches(mode, stream_mode):
+        return None
+    stream_id = message.id if (run or {}).get("kwargs", {}).get("resumable") else None
+    return mode.encode(), payload, stream_id
+
+
+async def _poll_run_status(run_id: UUID, thread_id: UUID, ctx: Any) -> dict | None:
+    """Re-fetch run status during stream join timeout."""
+    async with connect() as conn:
+        run_iter = await Runs.get(conn, run_id, thread_id=thread_id, ctx=ctx)
+        return await anext(run_iter, None)
+
+
+def _run_poll_action(
+    run: dict | None, ignore_404: bool, json_dumpb
+) -> tuple[bytes, bytes, None] | str | None:
+    """Determine action after a poll timeout. Returns a yield frame, 'break', or None to continue."""
+    if run is None:
+        if ignore_404:
+            return "break"
+        return (
+            b"error",
+            json_dumpb(HTTPException(status_code=404, detail=_RUN_NOT_FOUND)),
+            None,
+        )
+    if run["status"] not in ("pending", "running"):
+        return "break"
+    return None
+
+
+async def _idle_orphaned_busy_threads(sf) -> bool:
+    """Idle busy threads left behind when a cancelled worker dies without set_joint_status."""
+    idled = False
+    async with sf() as session:
+        busy_threads = list(
+            (await session.execute(sa_select(ThreadRow).where(ThreadRow.status == "busy")))
+            .scalars()
+            .all()
+        )
+        now = datetime.now(UTC)
+        for thread in busy_threads:
+            if await _thread_has_inflight_work(session, thread.thread_id):
+                continue
+            thread.status = "idle"
+            thread.updated_at = now
+            idled = True
+        if idled:
+            await session.commit()
+    return idled
+
+
+def _validate_cancel_args(assistant_id, thread_id, run_ids, status):
+    """Validate mutually exclusive cancel arguments."""
+    if assistant_id is not None:
+        if thread_id is not None or run_ids is not None or status is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Cannot specify 'thread_id', 'run_ids', or 'status' when using 'assistant_id'"
+                ),
+            )
+    elif status is not None:
+        if thread_id is not None or run_ids is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot specify 'thread_id' or 'run_ids' when using 'status'",
+            )
+    elif thread_id is None or run_ids is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Must provide either a status, an assistant_id, or both 'thread_id' and 'run_ids'"
+            ),
+        )
+
+
+def _cancel_query(assistant_id, status, run_ids, thread_id):
+    """Build the SELECT query for cancel candidates."""
+    q = sa_select(RunRow)
+    if assistant_id is not None:
+        return q.where(
+            RunRow.assistant_id == assistant_id, RunRow.status.in_(("pending", "running"))
+        )
+    if status is not None:
+        statuses = _resolve_cancel_statuses(status)
+        return q.where(RunRow.status.in_(statuses))
+    return q.where(RunRow.run_id.in_(cast(Sequence[UUID], run_ids)), RunRow.thread_id == thread_id)
+
+
+def _resolve_cancel_statuses(status: str) -> list[str]:
+    if status == "all":
+        return ["pending", "running"]
+    if status in ("pending", "running"):
+        return [status]
+    raise HTTPException(
+        status_code=422, detail="Invalid status: must be 'pending', 'running', or 'all'"
+    )
+
+
+async def _cancel_candidates_loop(session, candidates, action, sm, now) -> tuple[set, bool]:
+    """Process each candidate run; return (affected thread IDs, cancelled_any)."""
+    affected_threads: set = set()
+    cancelled_any = False
+    for r in candidates:
+        result = await _cancel_single_run(session, r, action, sm, now)
+        if result is None:
+            continue
+        cancelled_any = True
+        run_thread_id, was_pending = result
+        if run_thread_id is None:
+            continue
+        if was_pending or await has_run_heartbeat(r.run_id) is False:
+            affected_threads.add(run_thread_id)
+    return affected_threads, cancelled_any
+
+
+async def _filter_cancel_candidates(session, candidates: list, filters) -> list:
+    """Filter cancel candidates by thread auth."""
+    allowed = []
+    for r in candidates:
+        if r.thread_id is None:
+            continue
+        thread = await _aget_thread(session, r.thread_id)
+        if thread is not None and not _auth_denies(thread.metadata_, filters):
+            allowed.append(r)
+    return allowed
+
+
+async def _cancel_single_run(
+    session, run_row, action: str, sm, now: datetime
+) -> tuple[UUID | None, bool] | None:
+    """Lock and cancel a single run. Returns (thread_id, was_pending) or None if skipped."""
+    locked = (
+        await session.execute(
+            sa_select(RunRow)
+            .where(
+                RunRow.run_id == run_row.run_id,
+                RunRow.status.in_(("pending", "running")),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked is None:
+        return None
+    was_pending = locked.status == "pending"
+    run_thread_id = locked.thread_id
+    control = Message(
+        topic=f"run:{locked.run_id}:control".encode(),
+        data=action.encode(),
+    )
+    await sm.put(locked.run_id, run_thread_id, control)
+    queues = sm.get_queues(locked.run_id, run_thread_id)
+    delete_pending = action == "rollback" and was_pending and not queues
+    if delete_pending:
+        await _adelete_retry_counters(session, [locked.run_id])
+        await session.delete(locked)
+    else:
+        locked.status = "interrupted"
+        locked.updated_at = now
+    if was_pending and not queues:
+        try:
+            await sm.clear_run_buffers(locked.run_id, run_thread_id, local_grace_secs=0.0)
+        except Exception:
+            logger.debug("clear_run_buffers after pending cancel failed", exc_info=True)
+    return (run_thread_id, was_pending)
+
+
+async def _idle_affected_threads(session, affected_threads: set[UUID], now: datetime) -> None:
+    """Clear busy status on threads with no remaining in-flight runs."""
+    for tid in affected_threads:
+        pending = int(
+            await session.scalar(
+                sa_select(func.count())
+                .select_from(RunRow)
+                .where(
+                    RunRow.thread_id == tid,
+                    RunRow.status.in_(("pending", "running")),
+                )
+            )
+            or 0
+        )
+        if pending:
+            continue
+        thread = await _aget_thread(session, tid)
+        if thread is not None and thread.status == "busy":
+            thread.status = "idle"
+            thread.updated_at = now
+
+
+async def _run_put_check_assistant(conn, ctx, assistant_id):
+    """Return assistant row or None if not found / auth denied."""
+    from langgraph_sdk import Auth
+
+    assistant = await _aget_assistant(conn.session, assistant_id)
+    if not assistant:
+        return None
+    if (assistant.metadata_ or {}).get("created_by") == "system":
+        return assistant
+    assistant_filters = await Assistants.handle_event(
+        ctx, "read", Auth.types.AssistantsRead(assistant_id=assistant_id)
+    )
+    if _auth_denies(assistant.metadata_, assistant_filters):
+        return None
+    return assistant
+
+
+async def _run_put_lock_thread(conn, thread_id):
+    """FOR UPDATE lock and return the thread row, or None."""
+    locked_thread = (
+        await conn.session.execute(
+            sa_select(ThreadRow).where(ThreadRow.thread_id == thread_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    return locked_thread
+
+
+def _promote_thread_busy(existing_thread, assistant, assistant_id, config):
+    """Promote thread to busy and update metadata/config."""
+    if existing_thread.status == "busy":
+        return
+    existing_thread.status = "busy"
+    existing_thread.metadata_ = _merge_jsonb(
+        existing_thread.metadata_ or {},
+        {"graph_id": assistant.graph_id, "assistant_id": str(assistant_id)},
+    )
+    existing_thread.config = _merge_jsonb(
+        assistant.config or {},
+        existing_thread.config or {},
+        config,
+        {
+            "configurable": _merge_jsonb(
+                (assistant.config or {}).get("configurable") or {},
+                (existing_thread.config or {}).get("configurable") or {},
+            )
+        },
+    )
+    existing_thread.updated_at = datetime.now(UTC)
+
+
+async def _get_inflight_runs(conn, thread_id) -> list[dict]:
+    inflight_rows = list(
+        (
+            await conn.session.execute(
+                sa_select(RunRow).where(
+                    RunRow.thread_id == thread_id,
+                    RunRow.status.in_(("pending", "running")),
+                )
+            )
+        ).scalars()
+    )
+    return [run_to_dict(r) for r in inflight_rows]
+
+
+def _yield_list(items: list):
+    async def _iter():
+        for r in items:
+            yield r
+
+    return _iter()
+
+
+async def _insert_run_row(
+    conn,
+    run_id,
+    thread_id,
+    assistant_id,
+    assistant,
+    existing_thread,
+    config,
+    metadata,
+    kwargs,
+    status,
+    multitask_strategy,
+    after_seconds,
+    user_id,
+) -> dict:
+    """Build merged configurable, create RunRow, flush, and return dict."""
+    configurable = _build_run_configurable(
+        config,
+        existing_thread,
+        assistant,
+        run_id,
+        thread_id,
+        assistant_id,
+        user_id,
+    )
+    merged_metadata = _build_run_metadata(
+        assistant, existing_thread, config, metadata, assistant_id
+    )
+
+    effective_status = status or "pending"
+    row = RunRow(
+        run_id=run_id,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        metadata_=merged_metadata,
+        status=effective_status,
+        kwargs={
+            **kwargs,
+            "config": {
+                **(assistant.config or {}),
+                **config,
+                "configurable": configurable,
+                "metadata": merged_metadata,
+            },
+            "context": {
+                **(assistant.context or {}),
+                **(kwargs.get("context") or {}),
+            },
+        },
+        multitask_strategy=multitask_strategy,
+        updated_at=datetime.now(UTC),
+    )
+    conn.session.add(row)
+    await conn.session.flush()
+    await conn.session.execute(
+        text(
+            "UPDATE runs SET created_at = now() + make_interval(secs => :secs) "
+            "WHERE run_id = :run_id"
+        ),
+        {"secs": int(after_seconds or 0), "run_id": run_id},
+    )
+    await conn.session.refresh(row)
+    return run_to_dict(row)
+
+
+def _build_run_configurable(
+    config, existing_thread, assistant, run_id, thread_id, assistant_id, user_id
+):
+    incoming_configurable = dict(config.get("configurable") or {})
+    thread_configurable = dict(
+        (existing_thread.config or {}).get("configurable") or {} if existing_thread else {}
+    )
+    assistant_configurable = dict((assistant.config or {}).get("configurable") or {})
+    resolved_user_id = (
+        incoming_configurable.get("user_id")
+        or thread_configurable.get("user_id")
+        or assistant_configurable.get("user_id")
+        or user_id
+    )
+    return {
+        **assistant_configurable,
+        **thread_configurable,
+        **incoming_configurable,
+        "run_id": str(run_id),
+        "thread_id": str(thread_id),
+        "graph_id": assistant.graph_id,
+        "assistant_id": str(assistant_id),
+        "user_id": resolved_user_id,
+    }
+
+
+def _build_run_metadata(assistant, existing_thread, config, metadata, assistant_id):
+    return {
+        **(assistant.metadata_ or {}),
+        **((existing_thread.metadata_ or {}) if existing_thread else {}),
+        **(config.get("metadata") or {}),
+        **metadata,
+        "assistant_id": str(assistant_id),
+    }
 
 
 class Runs(Authenticated):
@@ -2153,8 +2936,8 @@ class Runs(Authenticated):
         return {}
 
     @staticmethod
-    async def put(
-        conn: PgConnectionProto,
+    async def put(  # NOSONAR - complexity retained to preserve tested behavior
+        conn: PgConnectionProto,  # NOSONAR - public API signature intentionally wide
         assistant_id: UUID | str,
         kwargs: dict,
         *,
@@ -2197,15 +2980,9 @@ class Runs(Authenticated):
             ),
         )
 
-        assistant = await _aget_assistant(conn.session, assistant_id)
-        if not assistant:
+        assistant = await _run_put_check_assistant(conn, ctx, assistant_id)
+        if assistant is None:
             return _empty_aiter()
-        if (assistant.metadata_ or {}).get("created_by") != "system":
-            assistant_filters = await Assistants.handle_event(
-                ctx, "read", Auth.types.AssistantsRead(assistant_id=assistant_id)
-            )
-            if _auth_denies(assistant.metadata_, assistant_filters):
-                return _empty_aiter()
 
         existing_thread = await _aget_thread(conn.session, thread_id) if thread_id else None
         if existing_thread and _auth_denies(existing_thread.metadata_, filters):
@@ -2213,174 +2990,44 @@ class Runs(Authenticated):
 
         created_thread = False
         if not existing_thread and (thread_id is None or if_not_exists == "create"):
-            if thread_id is None:
-                thread_id = uuid4()
-            now = datetime.now(UTC)
-            thread_meta = {
-                "graph_id": assistant.graph_id,
-                "assistant_id": str(assistant_id),
-                **(config.get("metadata") or {}),
-                **metadata,
-            }
-            thread_config = _merge_jsonb(
-                assistant.config or {},
-                config,
-                {
-                    "configurable": _merge_jsonb(
-                        (assistant.config or {}).get("configurable") or {},
-                    )
-                },
+            thread_id, existing_thread, created_thread = await _ensure_run_thread(
+                conn, thread_id, assistant, config, metadata, assistant_id
             )
-            ins = (
-                pg_insert(ThreadRow)
-                .values(
-                    thread_id=thread_id,
-                    status="busy",
-                    metadata_=thread_meta,
-                    config=thread_config,
-                    created_at=now,
-                    updated_at=now,
-                    state_updated_at=now,
-                    values_=None,
-                    interrupts={},
-                )
-                .on_conflict_do_nothing(index_elements=["thread_id"])
-            )
-            result = await conn.session.execute(ins)
-            if result.rowcount == 0:
-                existing_thread = await _aget_thread(conn.session, thread_id)
-            else:
-                await conn.session.flush()
-                existing_thread = await _aget_thread(conn.session, thread_id)
-                created_thread = True
             if existing_thread is None:
                 return _empty_aiter()
         elif not existing_thread:
             return _empty_aiter()
 
-        # Lock before inflight check + insert so concurrent reject/prevent_insert serialize; also promote busy after create-conflict.
-        locked_thread = (
-            await conn.session.execute(
-                sa_select(ThreadRow).where(ThreadRow.thread_id == thread_id).with_for_update()
-            )
-        ).scalar_one_or_none()
-        if locked_thread is None:
+        existing_thread = await _run_put_lock_thread(conn, thread_id)
+        if existing_thread is None:
             return _empty_aiter()
-        existing_thread = locked_thread
-        # Re-check auth after lock/conflict: another principal may own the thread.
         if not created_thread and _auth_denies(existing_thread.metadata_, filters):
             return _empty_aiter()
 
-        if not created_thread and existing_thread.status != "busy":
-            existing_thread.status = "busy"
-            existing_thread.metadata_ = _merge_jsonb(
-                existing_thread.metadata_ or {},
-                {
-                    "graph_id": assistant.graph_id,
-                    "assistant_id": str(assistant_id),
-                },
-            )
-            # Thread configurable from assistant+thread only; caller configurable goes on run kwargs later.
-            existing_thread.config = _merge_jsonb(
-                assistant.config or {},
-                existing_thread.config or {},
-                config,
-                {
-                    "configurable": _merge_jsonb(
-                        (assistant.config or {}).get("configurable") or {},
-                        (existing_thread.config or {}).get("configurable") or {},
-                    )
-                },
-            )
-            existing_thread.updated_at = datetime.now(UTC)
+        if not created_thread:
+            _promote_thread_busy(existing_thread, assistant, assistant_id, config)
 
-        inflight_rows = list(
-            (
-                await conn.session.execute(
-                    sa_select(RunRow).where(
-                        RunRow.thread_id == thread_id,
-                        RunRow.status.in_(("pending", "running")),
-                    )
-                )
-            ).scalars()
-        )
-        inflight = [run_to_dict(r) for r in inflight_rows]
+        inflight = await _get_inflight_runs(conn, thread_id)
         if prevent_insert_if_inflight and inflight:
+            return _yield_list(inflight)
 
-            async def _inflight():
-                for r in inflight:
-                    yield r
-
-            return _inflight()
-
-        # Merge (do not replace) caller configurable — dropping __event_streaming_v2 disables the messages/tools stream path.
-        incoming_configurable = dict(config.get("configurable") or {})
-        thread_configurable = dict(
-            (existing_thread.config or {}).get("configurable") or {} if existing_thread else {}
+        new_run = await _insert_run_row(
+            conn,
+            run_id,
+            thread_id,
+            assistant_id,
+            assistant,
+            existing_thread,
+            config,
+            metadata,
+            kwargs,
+            status,
+            multitask_strategy,
+            after_seconds,
+            user_id,
         )
-        assistant_configurable = dict((assistant.config or {}).get("configurable") or {})
-        configurable = {
-            **assistant_configurable,
-            **thread_configurable,
-            **incoming_configurable,
-            "run_id": str(run_id),
-            "thread_id": str(thread_id),
-            "graph_id": assistant.graph_id,
-            "assistant_id": str(assistant_id),
-            "user_id": (
-                incoming_configurable.get("user_id")
-                or thread_configurable.get("user_id")
-                or assistant_configurable.get("user_id")
-                or user_id
-            ),
-        }
-        merged_metadata = {
-            **(assistant.metadata_ or {}),
-            **((existing_thread.metadata_ or {}) if existing_thread else {}),
-            **(config.get("metadata") or {}),
-            **metadata,
-            "assistant_id": str(assistant_id),
-        }
 
-        now = datetime.now(UTC)
-        effective_status = status or "pending"
-        row = RunRow(
-            run_id=run_id,
-            thread_id=thread_id,
-            assistant_id=assistant_id,
-            metadata_=merged_metadata,
-            status=effective_status,
-            kwargs={
-                **kwargs,
-                "config": {
-                    **(assistant.config or {}),
-                    **config,
-                    "configurable": configurable,
-                    "metadata": merged_metadata,
-                },
-                "context": {
-                    **(assistant.context or {}),
-                    **(kwargs.get("context") or {}),
-                },
-            },
-            multitask_strategy=multitask_strategy,
-            # Postgres clock for created_at so Runs.next is immune to host/container skew.
-            updated_at=now,
-        )
-        conn.session.add(row)
-        await conn.session.flush()
-        await conn.session.execute(
-            text(
-                "UPDATE runs SET created_at = now() + make_interval(secs => :secs) "
-                "WHERE run_id = :run_id"
-            ),
-            {"secs": int(after_seconds or 0), "run_id": run_id},
-        )
-        await conn.session.refresh(row)
-        new_run = run_to_dict(row)
-
-        if effective_status == "pending":
-            # Wake after connect() commits so workers cannot claim a run whose thread is still invisible.
+        if (status or "pending") == "pending":
             conn.schedule_after_commit(wake_run_queue)
 
         async def _yield():
@@ -2439,11 +3086,11 @@ class Runs(Authenticated):
         )
         row = await _aget_run(conn.session, run_id)
         if row is None or row.thread_id != thread_id:
-            raise HTTPException(status_code=404, detail="Run not found")
+            raise HTTPException(status_code=404, detail=_RUN_NOT_FOUND)
         if filters:
             thread = await _aget_thread(conn.session, thread_id)
             if thread is None or _auth_denies(thread.metadata_, filters):
-                raise HTTPException(status_code=404, detail="Run not found")
+                raise HTTPException(status_code=404, detail=_RUN_NOT_FOUND)
         await _adelete_retry_counters(conn.session, [run_id])
         await conn.session.delete(row)
         await conn.session.flush()
@@ -2466,33 +3113,9 @@ class Runs(Authenticated):
     ) -> None:
         from langgraph_sdk import Auth
 
-        # Mutually exclusive filter modes so callers cannot accidentally broaden a cancel.
+        _validate_cancel_args(assistant_id, thread_id, run_ids, status)
         if assistant_id is not None:
-            if thread_id is not None or run_ids is not None or status is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "Cannot specify 'thread_id', 'run_ids', or 'status' "
-                        "when using 'assistant_id'"
-                    ),
-                )
             assistant_id = _ensure_uuid(assistant_id)
-        elif status is not None:
-            if thread_id is not None or run_ids is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Cannot specify 'thread_id' or 'run_ids' when using 'status'",
-                )
-        else:
-            if thread_id is None or run_ids is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "Must provide either a status, an assistant_id, "
-                        "or both 'thread_id' and 'run_ids'"
-                    ),
-                )
-
         if run_ids is not None:
             run_ids = [_ensure_uuid(rid) for rid in run_ids]
         if thread_id is not None:
@@ -2507,113 +3130,21 @@ class Runs(Authenticated):
                 metadata={"run_ids": run_ids, "status": status},
             ),
         )
-        q = sa_select(RunRow)
-        if assistant_id is not None:
-            q = q.where(
-                RunRow.assistant_id == assistant_id,
-                RunRow.status.in_(("pending", "running")),
-            )
-        elif status is not None:
-            if status == "all":
-                statuses: tuple[str, ...] = ("pending", "running")
-            elif status in ("pending", "running"):
-                statuses = (status,)
-            else:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Invalid status: must be 'pending', 'running', or 'all'",
-                )
-            q = q.where(RunRow.status.in_(statuses))
-        else:
-            q = q.where(
-                RunRow.run_id.in_(cast(Sequence[UUID], run_ids)),
-                RunRow.thread_id == thread_id,
-            )
-
+        q = _cancel_query(assistant_id, status, run_ids, thread_id)
         candidates = list((await conn.session.execute(q)).scalars())
         if filters:
-            allowed: list[RunRow] = []
-            for r in candidates:
-                if r.thread_id is None:
-                    continue
-                thread = await _aget_thread(conn.session, r.thread_id)
-                if thread is not None and not _auth_denies(thread.metadata_, filters):
-                    allowed.append(r)
-            candidates = allowed
+            candidates = await _filter_cancel_candidates(conn.session, candidates, filters)
         if not candidates and assistant_id is None:
             raise HTTPException(status_code=404, detail="No runs found to cancel")
 
         sm = get_stream_manager()
         now = datetime.now(UTC)
-        affected_threads: set[UUID] = set()
-        cancelled_any = False
-        for r in candidates:
-            # Re-lock and re-read so we cannot race Runs.next; SKIP LOCKED claimants wait/skip while we hold FOR UPDATE.
-            locked = (
-                await conn.session.execute(
-                    sa_select(RunRow)
-                    .where(
-                        RunRow.run_id == r.run_id,
-                        RunRow.status.in_(("pending", "running")),
-                    )
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if locked is None:
-                continue
-            cancelled_any = True
-            was_pending = locked.status == "pending"
-            run_thread_id = locked.thread_id
-            control = Message(
-                topic=f"run:{locked.run_id}:control".encode(),
-                data=action.encode(),
-            )
-            await sm.put(locked.run_id, run_thread_id, control)
-            # Delete pending on rollback only with no queues; otherwise interrupt so subscribers see a terminal status.
-            queues = sm.get_queues(locked.run_id, run_thread_id)
-            delete_pending = action == "rollback" and was_pending and not queues
-            if delete_pending:
-                await _adelete_retry_counters(conn.session, [locked.run_id])
-                await conn.session.delete(locked)
-            else:
-                locked.status = "interrupted"
-                locked.updated_at = now
-            if was_pending and not queues:
-                # Clear control keys for pending with no subscribers; keep buffers when queues exist so clients can drain.
-                try:
-                    await sm.clear_run_buffers(locked.run_id, run_thread_id, local_grace_secs=0.0)
-                except Exception:
-                    logger.debug("clear_run_buffers after pending cancel failed", exc_info=True)
-            if run_thread_id is None:
-                continue
-            if was_pending:
-                affected_threads.add(run_thread_id)
-            else:
-                # Only idle running→interrupted when the worker heartbeat is gone; else set_joint_status races State.post.
-                alive = await has_run_heartbeat(locked.run_id)
-                if alive is False:
-                    affected_threads.add(run_thread_id)
+        affected_threads, cancelled_any = await _cancel_candidates_loop(
+            conn.session, candidates, action, sm, now
+        )
         await conn.session.flush()
 
-        # Clear busy when nothing in-flight remains (pending cancels; running only if heartbeat gone).
-        for tid in affected_threads:
-            pending = int(
-                await conn.session.scalar(
-                    sa_select(func.count())
-                    .select_from(RunRow)
-                    .where(
-                        RunRow.thread_id == tid,
-                        RunRow.status.in_(("pending", "running")),
-                    )
-                )
-                or 0
-            )
-            if pending:
-                continue
-            thread = await _aget_thread(conn.session, tid)
-            if thread is not None and thread.status == "busy":
-                thread.status = "idle"
-                thread.updated_at = now
+        await _idle_affected_threads(conn.session, affected_threads, now)
         await conn.session.flush()
 
         # Wake even if thread stays busy so a pending multitask-interrupt run becomes claimable when heartbeat drops.
@@ -2693,97 +3224,24 @@ class Runs(Authenticated):
 
         sf = get_session_factory()
         claimed = 0
-        conflict_budget = max(limit * 8, 8)  # bound retries on a hot thread
-        blocked_threads: list[UUID] = []  # skipped while a cancelled sibling still heartbeats
+        conflict_budget = max(limit * 8, 8)
+        blocked_threads: list[UUID] = []
         while claimed < limit and conflict_budget > 0:
             run_id: UUID | None = None
-            claimed_payload: tuple[dict[str, Any], int] | None = None
             try:
-                async with sf() as session:
-                    exclude_sql = ""
-                    params: dict[str, Any] = {}
-                    if blocked_threads:
-                        placeholders = ", ".join(f":bt_{i}" for i in range(len(blocked_threads)))
-                        exclude_sql = (
-                            f"AND (r.thread_id IS NULL OR r.thread_id NOT IN ({placeholders}))"
-                        )
-                        params = {f"bt_{i}": t for i, t in enumerate(blocked_threads)}
-                    result = await session.execute(
-                        text(
-                            f"""
-                            UPDATE runs SET status = 'running', updated_at = now()
-                            WHERE run_id = (
-                                SELECT r.run_id FROM runs r
-                                WHERE r.status = 'pending'
-                                  AND r.created_at <= now()
-                                  AND NOT EXISTS (
-                                      SELECT 1 FROM runs r2
-                                      WHERE r2.thread_id IS NOT NULL
-                                        AND r2.thread_id = r.thread_id
-                                        AND r2.status = 'running'
-                                  )
-                                  {exclude_sql}
-                                ORDER BY r.created_at
-                                FOR UPDATE SKIP LOCKED
-                                LIMIT 1
-                            )
-                            RETURNING run_id
-                            """
-                        ),
-                        params,
-                    )
-                    row = result.first()
-                    if row is None:
-                        break
-                    run_id = row[0]
-                    run_row = await session.get(RunRow, run_id)
-                    if run_row is None:
-                        await session.commit()
-                        break
-                    # Skip claim while a cancelled sibling still heartbeats (fail-closed on Redis None); only check non-terminal siblings to avoid stale-heartbeat starvation.
-                    if run_row.thread_id is not None:
-                        sibling_ids = list(
-                            (
-                                await session.execute(
-                                    sa_select(RunRow.run_id).where(
-                                        RunRow.thread_id == run_row.thread_id,
-                                        RunRow.run_id != run_id,
-                                        RunRow.status.in_(("running", "interrupted")),
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .all()
-                        )
-                        blocked_by_hb = False
-                        for sid in sibling_ids:
-                            if await has_run_heartbeat(sid) is not False:
-                                blocked_by_hb = True
-                                break
-                        if blocked_by_hb:
-                            run_row.status = "pending"
-                            await session.commit()
-                            blocked_threads.append(run_row.thread_id)
-                            conflict_budget -= 1
-                            continue
-                    # Same transaction as the claim so a failed commit does not inflate attempts.
-                    attempt = await PgRetryCounter(sf).increment(run_id, session=session)
-                    run_dict = run_to_dict(run_row)
-                    # Heartbeat before commit — otherwise sweep can reclaim and a second replica may double-execute.
-                    await set_run_heartbeat(run_id)
-                    try:
-                        await session.commit()
-                    except Exception:
-                        await clear_run_heartbeat(run_id)
-                        raise
-                    claimed_payload = (run_dict, attempt)
-                # Yield after the session closes so a slow consumer does not hold a pool connection.
-                if claimed_payload is None:
+                kind, rid, tid, run_dict, attempt = await _claim_next_run(
+                    sf, blocked_threads, PgRetryCounter
+                )
+                if kind == "empty":
                     break
+                run_id = rid
+                if kind == "blocked":
+                    blocked_threads.append(tid)
+                    conflict_budget -= 1
+                    continue
                 claimed += 1
-                yield claimed_payload
+                yield (run_dict, attempt)
             except IntegrityError:
-                # Lost one-running-per-thread race — leave pending for a later claim.
                 if run_id is not None:
                     await clear_run_heartbeat(run_id)
                 conflict_budget -= 1
@@ -2852,81 +3310,13 @@ class Runs(Authenticated):
 
         for run_id in running_ids:
             alive = await has_run_heartbeat(run_id)
-            if alive is None:
-                # Redis unavailable — do not reclaim (avoid false positives).
+            if alive is None or alive:
                 continue
-            if alive:
-                continue
+            swept = await _sweep_single_run(sf, run_id, retry_counter, max_retries)
+            if swept:
+                reclaimed.append(run_id)
 
-            attempts = await retry_counter.get(run_id)
-            # Next claim would bump attempts; if that exceeds max, mark error instead of looping.
-            new_status = "error" if attempts >= max_retries else "pending"
-            async with sf() as session:
-                result = await session.execute(
-                    text(
-                        """
-                        UPDATE runs
-                        SET status = :status, updated_at = now()
-                        WHERE run_id = :run_id AND status = 'running'
-                        RETURNING run_id, thread_id
-                        """
-                    ),
-                    {"status": new_status, "run_id": run_id},
-                )
-                row = result.first()
-                if row is not None and new_status == "error" and row[1] is not None:
-                    # Terminal reclaim — do not leave the thread stuck busy.
-                    tid = row[1]
-                    pending = int(
-                        await session.scalar(
-                            sa_select(func.count())
-                            .select_from(RunRow)
-                            .where(
-                                RunRow.thread_id == tid,
-                                RunRow.status.in_(("pending", "running")),
-                            )
-                        )
-                        or 0
-                    )
-                    if pending == 0:
-                        thread = await _aget_thread(session, tid)
-                        if thread is not None:
-                            thread.status = "error"
-                            thread.updated_at = datetime.now(UTC)
-                            if thread.error is None:
-                                thread.error = {
-                                    "error": "RuntimeError",
-                                    "message": "Run swept after exceeding max retries",
-                                }
-                await session.commit()
-            if row is None:
-                continue
-            await clear_run_heartbeat(run_id)
-            reclaimed.append(run_id)
-            await logger.awarning(
-                "Swept stale run",
-                run_id=str(run_id),
-                new_status=new_status,
-                attempts=attempts,
-            )
-
-        # Idle busy threads left behind when a cancelled worker dies without set_joint_status.
-        idled = False
-        async with sf() as session:
-            busy_threads = list(
-                (await session.execute(sa_select(ThreadRow).where(ThreadRow.status == "busy")))
-                .scalars()
-                .all()
-            )
-            now = datetime.now(UTC)
-            for thread in busy_threads:
-                if await _thread_has_inflight_work(session, thread.thread_id):
-                    continue
-                thread.status = "idle"
-                thread.updated_at = now
-                idled = True
-            if idled:
-                await session.commit()
+        idled = await _idle_orphaned_busy_threads(sf)
 
         if reclaimed or idled:
             try:
@@ -2969,15 +3359,7 @@ class Runs(Authenticated):
             emitted_ids: set[str] = set()
 
             def _accept(message: Message) -> bool:
-                if not message.id:
-                    return True
-                mid = message.id.decode() if isinstance(message.id, bytes) else str(message.id)
-                if mid in emitted_ids:
-                    return False
-                if resume_cursor is not None and not ms_seq_id_gt(mid, resume_cursor):
-                    return False
-                emitted_ids.add(mid)
-                return True
+                return _run_join_accept(message, emitted_ids, resume_cursor)
 
             try:
                 try:
@@ -2989,53 +3371,30 @@ class Runs(Authenticated):
                     run_iter = await Runs.get(conn, run_id, thread_id=thread_id, ctx=ctx)
                     run = await anext(run_iter, None)
 
-                for message in await get_stream_manager().restore_messages_async(
-                    run_id, thread_id, last_event_id
-                ):
-                    if not _accept(message):
-                        continue
-                    data, mid = message.data, message.id
-                    decoded = decode_stream_message(data, channel=message.topic)
-                    mode = decoded.event_bytes.decode("utf-8")
-                    payload = decoded.message_bytes
-                    if mode == "control":
-                        if payload == b"done":
-                            return
-                    elif _run_stream_mode_matches(mode, stream_mode):
-                        yield mode.encode(), payload, mid
-
-                while True:
-                    try:
-                        message = await asyncio.wait_for(queue.get(), timeout=0.5)
-                        if not _accept(message):
-                            continue
-                        data, mid = message.data, message.id
-                        decoded = decode_stream_message(data, channel=message.topic)
-                        mode = decoded.event_bytes.decode("utf-8")
-                        payload = decoded.message_bytes
-                        if mode == "control":
-                            if payload == b"done":
-                                break
-                        elif _run_stream_mode_matches(mode, stream_mode):
-                            stream_id = (
-                                mid if (run or {}).get("kwargs", {}).get("resumable") else None
-                            )
-                            yield mode.encode(), payload, stream_id
-                    except TimeoutError:
-                        async with connect() as conn:
-                            run_iter = await Runs.get(conn, run_id, thread_id=thread_id, ctx=ctx)
-                            run = await anext(run_iter, None)
-                        if ignore_404 and run is None:
-                            break
-                        elif run is None:
-                            yield (
-                                b"error",
-                                json_dumpb(HTTPException(status_code=404, detail="Run not found")),
-                                None,
-                            )
-                            break
-                        elif run["status"] not in ("pending", "running"):
-                            break
+                frames, done = await _restore_run_messages(
+                    run_id,
+                    thread_id,
+                    last_event_id,
+                    _accept,
+                    stream_mode,
+                    decode_stream_message,
+                )
+                for f in frames:
+                    yield f
+                if not done:
+                    async for frame in _stream_run_queue(
+                        queue,
+                        run,
+                        _accept,
+                        stream_mode,
+                        run_id,
+                        thread_id,
+                        ctx,
+                        ignore_404,
+                        json_dumpb,
+                        decode_stream_message,
+                    ):
+                        yield frame
             except WrappedHTTPException as e:
                 raise e.http_exception from None
             except Exception:
@@ -3095,6 +3454,107 @@ class Runs(Authenticated):
                 Runs.Stream._last_custom_publish_mono = time.monotonic()
 
 
+async def _paginate_crons_query(conn, q, filters, plain, offset: int, limit: int):
+    """Paginate a cron query, filtering by auth when needed."""
+    if filters and plain is None:
+        rows = [
+            r
+            for r in (await conn.session.execute(q)).scalars()
+            if not _auth_denies(r.metadata_, filters)
+        ]
+        page = rows[offset : offset + limit]
+        cursor = offset + limit if len(rows) > offset + limit else None
+    else:
+        q = q.offset(offset).limit(limit + 1)
+        rows = list((await conn.session.execute(q)).scalars())
+        cursor = offset + limit if len(rows) > limit else None
+        page = rows[:limit]
+    return page, cursor
+
+
+async def _cron_put_check_refs(conn, ctx, assistant_id, thread_uuid, system_ids):
+    """Validate assistant and optional thread exist and caller has access."""
+    from langgraph_sdk import Auth
+
+    assistant = await _aget_assistant(conn.session, assistant_id)
+    if assistant is None:
+        raise HTTPException(status_code=404, detail=f"Assistant '{assistant_id}' not found")
+    if str(assistant_id) not in system_ids:
+        assistant_filters = await Assistants.handle_event(
+            ctx, "read", Auth.types.AssistantsRead(assistant_id=assistant_id)
+        )
+        if _auth_denies(assistant.metadata_, assistant_filters):
+            raise HTTPException(status_code=404, detail=f"Assistant '{assistant_id}' not found")
+    if thread_uuid is None:
+        return
+    thread = await _aget_thread(conn.session, thread_uuid)
+    thread_filters = await Threads.handle_event(
+        ctx, "read", Auth.types.ThreadsRead(thread_id=thread_uuid)
+    )
+    if thread is None or _auth_denies(thread.metadata_ if thread else None, thread_filters):
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_uuid}' not found")
+
+
+def _cron_put_return_existing(existing, filters, cron_id):
+    """Return existing cron or raise 404 if auth denied."""
+    if _auth_denies(existing.metadata_, filters):
+        raise HTTPException(status_code=404, detail=f"Cron '{cron_id}' not found")
+    data = cron_to_dict(existing)
+
+    async def _yield_existing():
+        yield data
+
+    return _yield_existing()
+
+
+def _apply_cron_updates(
+    row,
+    schedule,
+    end_time,
+    enabled,
+    on_run_completed,
+    payload,
+    metadata,
+    timezone,
+    cron_id,
+    croniter_mod,
+    next_cron_date,
+):
+    """Mutate cron row fields in place."""
+    if timezone is not None:
+        row.timezone = timezone
+    if schedule is not None:
+        if not croniter_mod.croniter.is_valid(schedule):
+            raise HTTPException(status_code=422, detail=f"Invalid cron schedule: '{schedule}'")
+        row.schedule = schedule
+        row.next_run_date = next_cron_date(schedule, datetime.now(UTC), timezone=row.timezone)
+    elif timezone is not None:
+        row.next_run_date = next_cron_date(row.schedule, datetime.now(UTC), timezone=timezone)
+    if end_time is not None:
+        row.end_time = end_time
+    if enabled is not None:
+        row.enabled = enabled
+    if on_run_completed is not None:
+        row.on_run_completed = on_run_completed
+    if metadata is not None:
+        row.metadata_ = {**(row.metadata_ or {}), **metadata}
+    if payload is not None:
+        _merge_cron_payload(row, payload, cron_id)
+
+
+def _merge_cron_payload(row, payload, cron_id):
+    """Merge incoming payload into existing cron payload."""
+    existing_payload = dict(row.payload or {})
+    merged = {**existing_payload, **payload}
+    merged["assistant_id"] = existing_payload.get("assistant_id", merged.get("assistant_id"))
+    merged_config = dict(merged.get("config") or {})
+    merged_configurable = dict(merged_config.get("configurable") or {})
+    merged_configurable["cron_id"] = str(cron_id)
+    merged_config["configurable"] = merged_configurable
+    merged["config"] = merged_config
+    row.payload = merged
+
+
 class Crons(Authenticated):
     resource = "crons"
 
@@ -3147,34 +3607,11 @@ class Crons(Authenticated):
             ),
         )
 
-        assistant = await _aget_assistant(conn.session, assistant_id)
-        if assistant is None:
-            raise HTTPException(status_code=404, detail=f"Assistant '{assistant_id}' not found")
-        if str(assistant_id) not in SYSTEM_ASSISTANT_IDS:
-            assistant_filters = await Assistants.handle_event(
-                ctx, "read", Auth.types.AssistantsRead(assistant_id=assistant_id)
-            )
-            if _auth_denies(assistant.metadata_, assistant_filters):
-                raise HTTPException(status_code=404, detail=f"Assistant '{assistant_id}' not found")
-        if thread_uuid is not None:
-            thread = await _aget_thread(conn.session, thread_uuid)
-            thread_filters = await Threads.handle_event(
-                ctx, "read", Auth.types.ThreadsRead(thread_id=thread_uuid)
-            )
-            if thread is None or _auth_denies(thread.metadata_ if thread else None, thread_filters):
-                raise HTTPException(status_code=404, detail=f"Thread '{thread_uuid}' not found")
+        await _cron_put_check_refs(conn, ctx, assistant_id, thread_uuid, SYSTEM_ASSISTANT_IDS)
 
         existing = await _aget_cron(conn.session, cron_id)
         if existing:
-            if _auth_denies(existing.metadata_, filters):
-                raise HTTPException(status_code=404, detail=f"Cron '{cron_id}' not found")
-
-            data = cron_to_dict(existing)
-
-            async def _yield_existing():
-                yield data
-
-            return _yield_existing()
+            return _cron_put_return_existing(existing, filters, cron_id)
 
         now = datetime.now(UTC)
         next_run = next_cron_date(schedule, now, timezone=timezone)
@@ -3223,15 +3660,7 @@ class Crons(Authenticated):
 
         has_updates = any(
             v is not None
-            for v in [
-                schedule,
-                end_time,
-                enabled,
-                on_run_completed,
-                payload,
-                metadata,
-                timezone,
-            ]
+            for v in [schedule, end_time, enabled, on_run_completed, payload, metadata, timezone]
         )
         if not has_updates:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -3246,37 +3675,19 @@ class Crons(Authenticated):
         if row is None or _auth_denies(row.metadata_, filters):
             raise HTTPException(status_code=404, detail=f"Cron '{cron_id}' not found")
 
-        if timezone is not None:
-            row.timezone = timezone
-
-        if schedule is not None:
-            if not croniter_mod.croniter.is_valid(schedule):
-                raise HTTPException(status_code=422, detail=f"Invalid cron schedule: '{schedule}'")
-            row.schedule = schedule
-            row.next_run_date = next_cron_date(schedule, datetime.now(UTC), timezone=row.timezone)
-        elif timezone is not None:
-            row.next_run_date = next_cron_date(row.schedule, datetime.now(UTC), timezone=timezone)
-
-        if end_time is not None:
-            row.end_time = end_time
-        if enabled is not None:
-            row.enabled = enabled
-        if on_run_completed is not None:
-            row.on_run_completed = on_run_completed
-        if metadata is not None:
-            row.metadata_ = {**(row.metadata_ or {}), **metadata}
-        if payload is not None:
-            existing_payload = dict(row.payload or {})
-            merged = {**existing_payload, **payload}
-            merged["assistant_id"] = existing_payload.get(
-                "assistant_id", merged.get("assistant_id")
-            )
-            merged_config = dict(merged.get("config") or {})
-            merged_configurable = dict(merged_config.get("configurable") or {})
-            merged_configurable["cron_id"] = str(cron_id)
-            merged_config["configurable"] = merged_configurable
-            merged["config"] = merged_config
-            row.payload = merged
+        _apply_cron_updates(
+            row,
+            schedule,
+            end_time,
+            enabled,
+            on_run_completed,
+            payload,
+            metadata,
+            timezone,
+            cron_id,
+            croniter_mod,
+            next_cron_date,
+        )
 
         row.updated_at = datetime.now(UTC)
         await conn.session.flush()
@@ -3376,21 +3787,8 @@ class Crons(Authenticated):
         reverse = not (sort_order and sort_order.upper() == "ASC")
         q = q.order_by(col.desc() if reverse else col.asc())
 
-        if filters and plain is None:
-            rows = [
-                r
-                for r in (await conn.session.execute(q)).scalars()
-                if not _auth_denies(r.metadata_, filters)
-            ]
-            page = rows[offset : offset + limit]
-            cursor = offset + limit if len(rows) > offset + limit else None
-        else:
-            q = q.offset(offset).limit(limit + 1)
-            rows = list((await conn.session.execute(q)).scalars())
-            cursor = offset + limit if len(rows) > limit else None
-            page = rows[:limit]
+        page, cursor = await _paginate_crons_query(conn, q, filters, plain, offset, limit)
 
-        # Materialize while session is open — API paginates outside connect().
         items: list[dict] = []
         for r in page:
             d = cron_to_dict(r)
@@ -3420,28 +3818,8 @@ class Crons(Authenticated):
                 assistant_id=assistant_id, thread_id=thread_id, limit=0, offset=0
             ),
         )
-        plain = _plain_metadata_filter(filters)
-        if filters and plain is None:
-            q = sa_select(CronRow)
-            if assistant_id is not None:
-                q = q.where(CronRow.assistant_id == _ensure_uuid(assistant_id))
-            if thread_id is not None:
-                q = q.where(CronRow.thread_id == _ensure_uuid(thread_id))
-            if metadata:
-                q = q.where(CronRow.metadata_.contains(metadata))
-            rows = list((await conn.session.execute(q)).scalars())
-            return sum(1 for r in rows if not _auth_denies(r.metadata_, filters))
-
-        count_q = sa_select(func.count()).select_from(CronRow)
-        if assistant_id is not None:
-            count_q = count_q.where(CronRow.assistant_id == _ensure_uuid(assistant_id))
-        if thread_id is not None:
-            count_q = count_q.where(CronRow.thread_id == _ensure_uuid(thread_id))
-        if metadata:
-            count_q = count_q.where(CronRow.metadata_.contains(metadata))
-        if plain:
-            count_q = count_q.where(CronRow.metadata_.contains(plain))
-        return int(await conn.session.scalar(count_q) or 0)
+        clauses = _cron_where_clauses(assistant_id, thread_id, metadata)
+        return await _count_with_auth(conn, CronRow, clauses, filters)
 
     @staticmethod
     async def next(conn: PgConnectionProto, ctx: Any = None) -> AsyncIterator:

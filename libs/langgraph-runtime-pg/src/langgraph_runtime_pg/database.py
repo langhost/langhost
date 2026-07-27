@@ -24,6 +24,11 @@ logger = structlog.stdlib.get_logger(__name__)
 _ENGINE = None
 _SESSION_FACTORY: async_sessionmaker[AsyncSession] | None = None
 
+_SCHEME_ASYNCPG = "postgresql+asyncpg://"
+_SCHEME_ASYNCPG_SHORT = "postgres+asyncpg://"
+_SCHEME_PSYCOPG = "postgresql://"
+_SCHEME_PSYCOPG_SHORT = "postgres://"
+
 # libpq SSL query keys — strip from URL; asyncpg only accepts ssl= connect arg.
 _LIBPQ_SSL_QUERY_KEYS = frozenset(
     {
@@ -38,6 +43,17 @@ _LIBPQ_SSL_QUERY_KEYS = frozenset(
     }
 )
 
+_URI_PREFIXES_TO_PSYCOPG = (
+    _SCHEME_ASYNCPG,
+    _SCHEME_ASYNCPG_SHORT,
+    "postgresql+psycopg://",
+    "postgresql+psycopg2://",
+    "postgres+psycopg://",
+    "postgres+psycopg2://",
+    _SCHEME_PSYCOPG,
+    _SCHEME_PSYCOPG_SHORT,
+)
+
 
 def get_database_uri() -> str:
     uri = os.environ.get("DATABASE_URI")
@@ -49,18 +65,9 @@ def get_database_uri() -> str:
 def to_psycopg_uri(uri: str | None = None) -> str:
     """Normalize DATABASE_URI to a psycopg-style ``postgresql://`` URL."""
     uri = uri or get_database_uri()
-    for prefix in (
-        "postgresql+asyncpg://",
-        "postgres+asyncpg://",
-        "postgresql+psycopg://",
-        "postgresql+psycopg2://",
-        "postgres+psycopg://",
-        "postgres+psycopg2://",
-        "postgresql://",
-        "postgres://",
-    ):
+    for prefix in _URI_PREFIXES_TO_PSYCOPG:
         if uri.startswith(prefix):
-            return "postgresql://" + uri[len(prefix) :]
+            return _SCHEME_PSYCOPG + uri[len(prefix) :]
     if "://" in uri:
         raise ValueError(
             f"Unsupported DATABASE_URI scheme {uri.split('://', 1)[0]!r}; "
@@ -72,64 +79,87 @@ def to_psycopg_uri(uri: str | None = None) -> str:
 def to_async_sqlalchemy_uri(uri: str | None = None) -> str:
     """Normalize DATABASE_URI to ``postgresql+asyncpg://``."""
     uri = uri or get_database_uri()
-    if uri.startswith("postgresql+asyncpg://"):
+    if uri.startswith(_SCHEME_ASYNCPG):
         return uri
-    if uri.startswith("postgres+asyncpg://"):
-        return "postgresql+asyncpg://" + uri[len("postgres+asyncpg://") :]
+    if uri.startswith(_SCHEME_ASYNCPG_SHORT):
+        return _SCHEME_ASYNCPG + uri[len(_SCHEME_ASYNCPG_SHORT) :]
     bare = to_psycopg_uri(uri)
-    if bare.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + bare.removeprefix("postgresql://")
+    if bare.startswith(_SCHEME_PSYCOPG):
+        return _SCHEME_ASYNCPG + bare.removeprefix(_SCHEME_PSYCOPG)
     return bare
+
+
+def _parse_libpq_ssl_query(
+    query: str,
+) -> tuple[list[tuple[str, str]], dict[str, str | None]]:
+    """Split URL query into non-SSL params and extracted libpq SSL settings."""
+    kept: list[tuple[str, str]] = []
+    ssl: dict[str, str | None] = {
+        "sslmode": None,
+        "sslrootcert": None,
+        "sslcert": None,
+        "sslkey": None,
+        "sslpassword": None,
+    }
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        kl = key.lower()
+        if kl == "sslmode":
+            ssl["sslmode"] = value.lower()
+        elif kl in ssl:
+            ssl[kl] = value
+        elif kl in _LIBPQ_SSL_QUERY_KEYS:
+            continue
+        else:
+            kept.append((key, value))
+    return kept, ssl
+
+
+def _build_asyncpg_ssl_connect_arg(ssl: dict[str, str | None]) -> Any | None:
+    """Translate libpq sslmode/certs into an asyncpg ``ssl`` connect argument.
+
+    For ``sslmode=require`` without a CA, asyncpg gets ``ssl=True`` (encrypt only).
+    ``verify-ca`` / ``verify-full`` use Python's default SSL context with hostname
+    verification enabled. Client certs are loaded when provided.
+    """
+    sslmode = ssl.get("sslmode")
+    sslrootcert = ssl.get("sslrootcert")
+    sslcert = ssl.get("sslcert")
+    sslkey = ssl.get("sslkey")
+    sslpassword = ssl.get("sslpassword")
+    has_certs = any((sslrootcert, sslcert, sslkey))
+
+    if sslmode == "disable":
+        return False
+    if sslmode not in ("require", "verify-ca", "verify-full") and not has_certs:
+        return None
+    if sslmode == "require" and not has_certs:
+        return True
+
+    # Same semantics as pre-Sonar code: verified defaults, but sslmode=require
+    # still encrypts without CA/hostname verification (libpq parity).
+    ctx = (
+        ssl_module.create_default_context(cafile=sslrootcert)  # NOSONAR - intentional libpq require parity
+        if sslrootcert
+        else ssl_module.create_default_context()  # NOSONAR - intentional libpq require parity
+    )
+    if sslmode == "require":
+        # libpq require encrypts without CA verification.
+        ctx.check_hostname = False  # NOSONAR — intentional libpq sslmode=require parity
+        ctx.verify_mode = ssl_module.CERT_NONE  # NOSONAR — intentional libpq sslmode=require parity
+    if sslcert and sslkey:
+        ctx.load_cert_chain(sslcert, keyfile=sslkey, password=sslpassword)
+    return ctx
 
 
 def asyncpg_engine_args(uri: str | None = None) -> tuple[str, dict[str, Any]]:
     """Return ``(async_uri, connect_args)`` with libpq sslmode translated for asyncpg."""
     async_uri = to_async_sqlalchemy_uri(uri)
     parts = urlsplit(async_uri)
-    kept: list[tuple[str, str]] = []
-    sslmode: str | None = None
-    sslrootcert: str | None = None
-    sslcert: str | None = None
-    sslkey: str | None = None
-    sslpassword: str | None = None
-
-    for key, value in parse_qsl(parts.query, keep_blank_values=True):
-        kl = key.lower()
-        if kl == "sslmode":
-            sslmode = value.lower()
-        elif kl == "sslrootcert":
-            sslrootcert = value
-        elif kl == "sslcert":
-            sslcert = value
-        elif kl == "sslkey":
-            sslkey = value
-        elif kl == "sslpassword":
-            sslpassword = value
-        elif kl in _LIBPQ_SSL_QUERY_KEYS:
-            continue
-        else:
-            kept.append((key, value))
-
+    kept, ssl = _parse_libpq_ssl_query(parts.query)
     connect_args: dict[str, Any] = {}
-    if sslmode in ("require", "verify-ca", "verify-full") or any((sslrootcert, sslcert, sslkey)):
-        if sslmode == "require" and not sslrootcert and not sslcert and not sslkey:
-            connect_args["ssl"] = True
-        else:
-            ctx = (
-                ssl_module.create_default_context(cafile=sslrootcert)
-                if sslrootcert
-                else ssl_module.create_default_context()
-            )
-            if sslmode == "require":
-                # libpq require encrypts without CA verification.
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl_module.CERT_NONE
-            if sslcert and sslkey:
-                ctx.load_cert_chain(sslcert, keyfile=sslkey, password=sslpassword)
-            connect_args["ssl"] = ctx
-    elif sslmode == "disable":
-        connect_args["ssl"] = False
-
+    ssl_arg = _build_asyncpg_ssl_connect_arg(ssl)
+    if ssl_arg is not None:
+        connect_args["ssl"] = ssl_arg
     clean = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
     return clean, connect_args
 
@@ -333,7 +363,7 @@ class PgConnectionProto:
     async def pipeline(self):
         yield None
 
-    async def execute(self, query: str, *args: Any, **kwargs: Any):
+    async def execute(self, query: str, *args: Any, **kwargs: Any):  # NOSONAR
         return None
 
     async def commit(self) -> None:

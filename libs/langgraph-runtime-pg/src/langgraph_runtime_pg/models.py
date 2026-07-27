@@ -9,6 +9,9 @@ from sqlalchemy import DateTime, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+_JSONB_EMPTY = text("'{}'::jsonb")
+_NOW = text("now()")
+
 
 class Base(DeclarativeBase):
     pass
@@ -33,17 +36,17 @@ class AssistantRow(Base):
     graph_id: Mapped[str] = mapped_column(String(256), nullable=False)
     name: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
-    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
+    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     metadata_: Mapped[dict] = mapped_column(
-        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        "metadata", JSONB, nullable=False, server_default=_JSONB_EMPTY
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
 
 
@@ -53,15 +56,15 @@ class AssistantVersionRow(Base):
     assistant_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     graph_id: Mapped[str] = mapped_column(String(256), nullable=False)
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
-    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
+    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     metadata_: Mapped[dict] = mapped_column(
-        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        "metadata", JSONB, nullable=False, server_default=_JSONB_EMPTY
     )
     name: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
 
 
@@ -83,19 +86,17 @@ class ThreadRow(Base):
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle")
     metadata_: Mapped[dict] = mapped_column(
-        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        "metadata", JSONB, nullable=False, server_default=_JSONB_EMPTY
     )
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     values_: Mapped[dict | None] = mapped_column("values", JSONB, nullable=True)
-    interrupts: Mapped[dict] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
-    )
+    interrupts: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     error: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     state_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -124,15 +125,15 @@ class RunRow(Base):
     assistant_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     metadata_: Mapped[dict] = mapped_column(
-        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        "metadata", JSONB, nullable=False, server_default=_JSONB_EMPTY
     )
-    kwargs: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    kwargs: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     multitask_strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
 
 
@@ -156,9 +157,9 @@ class CronRow(Base):
     assistant_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     thread_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     schedule: Mapped[str] = mapped_column(String(128), nullable=False)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     metadata_: Mapped[dict] = mapped_column(
-        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        "metadata", JSONB, nullable=False, server_default=_JSONB_EMPTY
     )
     next_run_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -167,10 +168,10 @@ class CronRow(Base):
     on_run_completed: Mapped[str | None] = mapped_column(String(16), nullable=True)
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
 
 
@@ -179,12 +180,12 @@ class StoreItemRow(Base):
 
     prefix: Mapped[str] = mapped_column(Text, primary_key=True)
     key: Mapped[str] = mapped_column(Text, primary_key=True)
-    value: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=_NOW
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

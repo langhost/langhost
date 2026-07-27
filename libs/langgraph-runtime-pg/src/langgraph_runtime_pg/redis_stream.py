@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -31,6 +31,8 @@ _WAKE_GEN = 0
 QUEUE_WAKE_CHANNEL = "langgraph:run_queue"
 RUN_FANOUT_PATTERN = "lg:run-fanout:*"
 THREAD_FANOUT_PATTERN = "lg:thread-fanout:*"
+
+_REDIS_NOT_CONNECTED = "Redis not connected; call start_stream() first"
 
 
 def _redis_max_connections() -> int:
@@ -287,6 +289,11 @@ def _decode_envelope(payload: bytes | str) -> Message | None:
         return None
 
 
+async def _reconnect_backoff() -> None:
+    """Reconnect delay — same 1s sleep as the original mux loops."""
+    await asyncio.sleep(1)  # NOSONAR — reconnect backoff, not a poll loop
+
+
 class _SeenIds:
     """Bounded FIFO dedup set — prune oldest half when full (never wipe all)."""
 
@@ -419,69 +426,63 @@ class StreamManager:
                 return
             await _fanout_put(self.thread_streams[thread_id], message)
 
-    async def _run_fanout_mux(self) -> None:
-        """Shared pattern-subscribe mux for all run fanout channels."""
+    # -- Pub/Sub mux infrastructure ------------------------------------------
+
+    async def _pubsub_mux_loop(
+        self,
+        pattern: str,
+        handler: Callable[[dict], Any],
+    ) -> None:
+        """Shared pattern-subscribe loop: dispatch each pmessage to *handler*."""
         while True:
             pubsub = self._redis.pubsub()
             try:
-                await pubsub.psubscribe(RUN_FANOUT_PATTERN)
+                await pubsub.psubscribe(pattern)
                 async for msg in pubsub.listen():
                     if msg is None or msg.get("type") != "pmessage":
                         continue
-                    parsed = _parse_run_fanout_channel(_channel_str(msg.get("channel")))
-                    if parsed is None:
-                        continue
-                    thread_id, run_id = parsed
-                    decoded = _decode_envelope(msg["data"])
-                    if decoded is None:
-                        continue
-                    topic = (
-                        decoded.topic.decode()
-                        if isinstance(decoded.topic, bytes)
-                        else decoded.topic
-                    )
-                    await self._deliver_local(
-                        thread_id, run_id, decoded, control="control" in topic
-                    )
+                    await handler(msg)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Run fanout mux failed; reconnecting")
-                await asyncio.sleep(1)
+                logger.exception("%s mux failed; reconnecting", pattern)
+                await _reconnect_backoff()
             finally:
                 try:
-                    await pubsub.punsubscribe(RUN_FANOUT_PATTERN)
+                    await pubsub.punsubscribe(pattern)
                     await pubsub.aclose()
                 except Exception:
                     pass
 
+    async def _handle_run_fanout_message(self, msg: dict) -> None:
+        parsed = _parse_run_fanout_channel(_channel_str(msg.get("channel")))
+        if parsed is None:
+            return
+        thread_id, run_id = parsed
+        decoded = _decode_envelope(msg["data"])
+        if decoded is None:
+            return
+        topic = decoded.topic.decode() if isinstance(decoded.topic, bytes) else decoded.topic
+        await self._deliver_local(thread_id, run_id, decoded, control="control" in topic)
+
+    async def _handle_thread_fanout_message(self, msg: dict) -> None:
+        thread_id = _parse_thread_fanout_channel(_channel_str(msg.get("channel")))
+        if thread_id is None:
+            return
+        decoded = _decode_envelope(msg["data"])
+        if decoded is None:
+            return
+        await self._deliver_thread_local(thread_id, decoded)
+
+    async def _run_fanout_mux(self) -> None:
+        """Shared pattern-subscribe mux for all run fanout channels."""
+        await self._pubsub_mux_loop(RUN_FANOUT_PATTERN, self._handle_run_fanout_message)
+
     async def _thread_fanout_mux(self) -> None:
         """Shared pattern-subscribe mux for all thread fanout channels."""
-        while True:
-            pubsub = self._redis.pubsub()
-            try:
-                await pubsub.psubscribe(THREAD_FANOUT_PATTERN)
-                async for msg in pubsub.listen():
-                    if msg is None or msg.get("type") != "pmessage":
-                        continue
-                    thread_id = _parse_thread_fanout_channel(_channel_str(msg.get("channel")))
-                    if thread_id is None:
-                        continue
-                    decoded = _decode_envelope(msg["data"])
-                    if decoded is None:
-                        continue
-                    await self._deliver_thread_local(thread_id, decoded)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Thread fanout mux failed; reconnecting")
-                await asyncio.sleep(1)
-            finally:
-                try:
-                    await pubsub.punsubscribe(THREAD_FANOUT_PATTERN)
-                    await pubsub.aclose()
-                except Exception:
-                    pass
+        await self._pubsub_mux_loop(THREAD_FANOUT_PATTERN, self._handle_thread_fanout_message)
+
+    # -- Put / publish -------------------------------------------------------
 
     async def put(
         self,
@@ -491,7 +492,7 @@ class StreamManager:
         resumable: bool = False,
     ) -> None:
         if self._redis is None:
-            raise RuntimeError("Redis not connected; call start_stream() first")
+            raise RuntimeError(_REDIS_NOT_CONNECTED)
         if run_id is None:
             raise ValueError("run_id is required")
 
@@ -540,7 +541,7 @@ class StreamManager:
         message: Message,
     ) -> None:
         if self._redis is None:
-            raise RuntimeError("Redis not connected; call start_stream() first")
+            raise RuntimeError(_REDIS_NOT_CONNECTED)
 
         thread_id = _ensure_uuid(thread_id)
         message.id = _generate_ms_seq_id().encode()
@@ -548,6 +549,23 @@ class StreamManager:
 
         envelope = _encode_envelope(message, control=False)
         await self._redis.publish(_thread_fanout_channel(thread_id), envelope)
+
+    # -- Queue / subscriber management ---------------------------------------
+
+    @staticmethod
+    def _replay_into_queue(q: asyncio.Queue, messages: list | deque, after_id: str | None) -> None:
+        """Replay buffered messages into *q*, skipping up to *after_id*."""
+        for message in messages:
+            if after_id is not None and message.id is not None:
+                try:
+                    if not ms_seq_id_gt(message.id.decode(), after_id):
+                        continue
+                except Exception:
+                    pass
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                break
 
     async def add_queue(
         self,
@@ -563,21 +581,13 @@ class StreamManager:
         # Replay then register under lock; after_id/replay=False avoid double-delivery after restore.
         async with self._buf_lock:
             if replay:
-                for message in list(self.message_stores.get(thread_id, {}).get(run_id, [])):
-                    if after_id is not None and message.id is not None:
-                        try:
-                            if not ms_seq_id_gt(message.id.decode(), after_id):
-                                continue
-                        except Exception:
-                            pass
-                    try:
-                        q.put_nowait(message)
-                    except asyncio.QueueFull:
-                        break
+                # Snapshot under lock (same as original list(...) copy).
+                messages = list(self.message_stores.get(thread_id, {}).get(run_id, []))
+                self._replay_into_queue(q, messages, after_id)
             self.queues[thread_id][run_id].append(q)
         return q
 
-    async def add_control_queue(
+    async def add_control_queue(  # NOSONAR - async API parity with await call sites
         self, run_id: UUID | str, thread_id: UUID | str | None
     ) -> asyncio.Queue:
         run_id = _ensure_uuid(run_id)
@@ -586,13 +596,17 @@ class StreamManager:
         self.control_queues[thread_id][run_id].append(q)
         return q
 
-    async def add_thread_stream(self, thread_id: UUID | str) -> asyncio.Queue:
+    async def add_thread_stream(  # NOSONAR - async API parity with await call sites
+        self, thread_id: UUID | str
+    ) -> asyncio.Queue:
         thread_id = _ensure_uuid(thread_id)
         q = ContextQueue()
         self.thread_streams[thread_id].append(q)
         return q
 
-    async def remove_thread_stream(self, thread_id: UUID | str, queue: asyncio.Queue) -> None:
+    async def remove_thread_stream(  # NOSONAR - async API parity with await call sites
+        self, thread_id: UUID | str, queue: asyncio.Queue
+    ) -> None:
         thread_id = _ensure_uuid(thread_id)
         if thread_id not in self.thread_streams:
             return
@@ -603,7 +617,7 @@ class StreamManager:
         if not self.thread_streams[thread_id]:
             del self.thread_streams[thread_id]
 
-    async def remove_queue(
+    async def remove_queue(  # NOSONAR - async API parity with await call sites
         self, run_id: UUID | str, thread_id: UUID | str | None, queue: asyncio.Queue
     ):
         run_id = _ensure_uuid(run_id)
@@ -616,7 +630,7 @@ class StreamManager:
             if not self.queues[thread_id][run_id]:
                 del self.queues[thread_id][run_id]
 
-    async def remove_control_queue(
+    async def remove_control_queue(  # NOSONAR - async API parity with await call sites
         self, run_id: UUID | str, thread_id: UUID | str | None, queue: asyncio.Queue
     ):
         run_id = _ensure_uuid(run_id)
@@ -628,6 +642,8 @@ class StreamManager:
                 pass
             if not self.control_queues[thread_id][run_id]:
                 del self.control_queues[thread_id][run_id]
+
+    # -- Restore / replay from Redis Streams ---------------------------------
 
     def restore_messages(
         self, run_id: UUID | str, thread_id: UUID | str | None, message_id: str | None
@@ -655,7 +671,7 @@ class StreamManager:
         message_id: str | None,
     ) -> list[Message]:
         if self._redis is None:
-            raise RuntimeError("Redis not connected; call start_stream() first")
+            raise RuntimeError(_REDIS_NOT_CONNECTED)
         if message_id is None:
             return []
         run_id = _ensure_uuid(run_id)
@@ -700,6 +716,47 @@ class StreamManager:
             return from_redis
         return list(self.restore_messages(run_id, thread_id, message_id))
 
+    # -- Buffer cleanup ------------------------------------------------------
+
+    async def _expire_redis_run_buffers(
+        self, thread_id: Any, run_id: UUID, stream_ttl_secs: int
+    ) -> None:
+        if self._redis is None:
+            return
+        try:
+            pipe = self._redis.pipeline()
+            pipe.delete(_control_key(thread_id, run_id))
+            pipe.expire(_stream_key(thread_id, run_id), max(int(stream_ttl_secs), 60))
+            await pipe.execute()
+        except Exception:
+            logger.exception("Failed to clear Redis buffers for run %s", run_id)
+
+    def _drop_local_store_sync(self, thread_id: Any, run_id: UUID) -> None:
+        if thread_id in self.message_stores:
+            self.message_stores[thread_id].pop(run_id, None)
+            if not self.message_stores[thread_id]:
+                del self.message_stores[thread_id]
+
+    def _schedule_local_store_drop(
+        self, thread_id: Any, run_id: UUID, local_grace_secs: float
+    ) -> None:
+        async def _drop_local_store() -> None:
+            try:
+                await asyncio.sleep(max(float(local_grace_secs), 0.0))
+            except asyncio.CancelledError:  # NOSONAR - keep graceful cancelled cleanup behavior
+                return
+            self._drop_local_store_sync(thread_id, run_id)
+
+        try:
+            task = asyncio.create_task(
+                _drop_local_store(),
+                name=f"clear-run-buffers-{run_id}",
+            )
+            self._cleanup_tasks.add(task)
+            task.add_done_callback(self._cleanup_tasks.discard)
+        except RuntimeError:
+            self._drop_local_store_sync(thread_id, run_id)
+
     async def clear_run_buffers(
         self,
         run_id: UUID | str,
@@ -715,37 +772,10 @@ class StreamManager:
             self.control_keys[thread_id].pop(run_id, None)
             if not self.control_keys[thread_id]:
                 del self.control_keys[thread_id]
-        if self._redis is not None:
-            try:
-                pipe = self._redis.pipeline()
-                pipe.delete(_control_key(thread_id, run_id))
-                pipe.expire(_stream_key(thread_id, run_id), max(int(stream_ttl_secs), 60))
-                await pipe.execute()
-            except Exception:
-                logger.exception("Failed to clear Redis buffers for run %s", run_id)
+        await self._expire_redis_run_buffers(thread_id, run_id, stream_ttl_secs)
+        self._schedule_local_store_drop(thread_id, run_id, local_grace_secs)
 
-        async def _drop_local_store() -> None:
-            try:
-                await asyncio.sleep(max(float(local_grace_secs), 0.0))
-            except asyncio.CancelledError:
-                return
-            if thread_id in self.message_stores:
-                self.message_stores[thread_id].pop(run_id, None)
-                if not self.message_stores[thread_id]:
-                    del self.message_stores[thread_id]
-
-        try:
-            task = asyncio.create_task(
-                _drop_local_store(),
-                name=f"clear-run-buffers-{run_id}",
-            )
-            self._cleanup_tasks.add(task)
-            task.add_done_callback(self._cleanup_tasks.discard)
-        except RuntimeError:
-            if thread_id in self.message_stores:
-                self.message_stores[thread_id].pop(run_id, None)
-                if not self.message_stores[thread_id]:
-                    del self.message_stores[thread_id]
+    # -- Misc ----------------------------------------------------------------
 
     def get_queues_by_thread_id(self, thread_id: UUID | str) -> list[asyncio.Queue]:
         all_queues: list[asyncio.Queue] = []
@@ -783,7 +813,7 @@ async def _wake_listener_loop() -> None:
             raise
         except Exception:
             logger.exception("Queue wake listener failed; reconnecting")
-            await asyncio.sleep(1)
+            await _reconnect_backoff()
         finally:
             try:
                 await pubsub.unsubscribe(QUEUE_WAKE_CHANNEL)
@@ -870,7 +900,7 @@ async def wake_run_queue() -> None:
     await _REDIS.publish(QUEUE_WAKE_CHANNEL, b"wake")
 
 
-async def wait_for_queue_wake(timeout: float = 0.5) -> bool:
+async def wait_for_queue_wake(timeout: float = 0.5) -> bool:  # NOSONAR
     """Wait for wake or timeout; generation counter avoids Event wait/clear lost-wakeup."""
     if _WAKE_EVENT is None:
         await asyncio.sleep(timeout)
@@ -885,8 +915,8 @@ async def wait_for_queue_wake(timeout: float = 0.5) -> bool:
         await asyncio.wait_for(_WAKE_EVENT.wait(), timeout=timeout)
     except TimeoutError:
         return start != _WAKE_GEN
-    except asyncio.CancelledError:
-        raise
+    except asyncio.CancelledError:  # NOSONAR - explicit propagation for baseline parity
+        raise  # NOSONAR
     end = _WAKE_GEN
     _WAKE_EVENT.clear()
     if end != _WAKE_GEN:

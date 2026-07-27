@@ -236,9 +236,13 @@ async def test_sslmode_require_no_longer_typeerrors_on_engine_connect() -> None:
 
     broken_engine = create_async_engine(broken, pool_size=1, max_overflow=0)
     try:
-        with pytest.raises(TypeError, match="sslmode"):
+
+        async def _probe_broken():
             async with broken_engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
+
+        with pytest.raises(TypeError, match="sslmode"):
+            await _probe_broken()
     finally:
         await broken_engine.dispose()
 

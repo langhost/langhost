@@ -314,12 +314,10 @@ async def test_state_update_blocked_while_cancelled_worker_heartbeat_alive(pg_ru
 
     async with connect() as conn:
         await ops.Runs.cancel(conn, [rid], thread_id=thread_id, action="interrupt")
+        post = ops.Threads.State.post
+        payload = {"configurable": {"thread_id": str(thread_id)}}
         with pytest.raises(HTTPException) as ei:
-            await ops.Threads.State.post(
-                conn,
-                {"configurable": {"thread_id": str(thread_id)}},
-                values={"x": 1},
-            )
+            await post(conn, payload, values={"x": 1})
     assert ei.value.status_code == 409, (
         f"expected 409 while cancelled worker still heartbeats, got {ei.value}"
     )
@@ -482,12 +480,10 @@ async def test_state_update_blocked_when_heartbeat_check_unknown(pg_runtime, mon
     monkeypatch.setattr(ops, "has_run_heartbeat", _unknown)
 
     async with connect() as conn:
+        post = ops.Threads.State.post
+        payload = {"configurable": {"thread_id": str(thread_id)}}
         with pytest.raises(HTTPException) as ei:
-            await ops.Threads.State.post(
-                conn,
-                {"configurable": {"thread_id": str(thread_id)}},
-                values={"x": 1},
-            )
+            await post(conn, payload, values={"x": 1})
     assert ei.value.status_code == 409, (
         f"expected 409 when heartbeat check is unknown, got {ei.value}"
     )

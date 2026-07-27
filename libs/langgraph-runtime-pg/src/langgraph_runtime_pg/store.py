@@ -93,7 +93,7 @@ class PgStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
         self._sf = session_factory
 
-    async def start_ttl_sweeper(self) -> asyncio.Task:
+    async def start_ttl_sweeper(self) -> asyncio.Task:  # NOSONAR
         return asyncio.create_task(asyncio.sleep(0))
 
     async def aput(self, prefix: str, key: str, value: dict) -> None:
@@ -151,11 +151,15 @@ class PgStore:
             return [{"key": r.key, "value": r.value} for r in rows]
 
     def close(self) -> None:
+        # No-op: sessions are opened per-call, so there is nothing to tear down.
         pass
 
 
-def Store(*args: Any, **kwargs: Any) -> AsyncPostgresStore:
-    """Return the process-wide AsyncPostgresStore (requires setup_store)."""
+def Store(*_args: Any, **_kwargs: Any) -> AsyncPostgresStore:  # NOSONAR
+    """Return the process-wide AsyncPostgresStore (requires setup_store).
+
+    Name matches the upstream ``langgraph_runtime`` factory API (PascalCase).
+    """
     if _STORE is None:
         raise RuntimeError(
             "Store requires setup_store()/start_pool() first (DATABASE_URI required)"

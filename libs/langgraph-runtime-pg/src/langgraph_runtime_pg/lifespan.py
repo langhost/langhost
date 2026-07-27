@@ -25,6 +25,60 @@ def get_last_error() -> BaseException | None:
     return _LAST_LIFESPAN_ERROR
 
 
+class _StartedServices:
+    """Tracks which services have been started for cleanup."""
+
+    __slots__ = ("checkpointer", "http", "pool", "ui")
+
+    def __init__(self) -> None:
+        self.http = False
+        self.pool = False
+        self.checkpointer = False
+        self.ui = False
+
+
+async def _startup_runtime(started: _StartedServices) -> None:
+    """Start HTTP client, PG pool, checkpointer, and UI bundler."""
+    from langgraph_api import _checkpointer as api_checkpointer
+    from langgraph_api.http import start_http_client
+    from langgraph_api.js.ui import start_ui_bundler
+
+    await start_http_client()
+    started.http = True
+    await start_pool()
+    started.pool = True
+    await api_checkpointer.start_checkpointer()
+    started.checkpointer = True
+    await start_ui_bundler()
+    started.ui = True
+
+
+async def _safe_shutdown(label: str, coro) -> None:
+    try:
+        await coro
+    except Exception:
+        logger.debug("%s failed during lifespan cleanup", label, exc_info=True)
+
+
+async def _shutdown_runtime(started: _StartedServices) -> None:
+    """Tear down services in reverse order, tolerating individual failures."""
+    from langgraph_api import _checkpointer as api_checkpointer, graph, store as api_store
+    from langgraph_api.http import stop_http_client, stop_webhook_http_client
+    from langgraph_api.js.ui import stop_ui_bundler
+
+    await _safe_shutdown("exit_store", api_store.exit_store())
+    if started.checkpointer:
+        await _safe_shutdown("exit_checkpointer", api_checkpointer.exit_checkpointer())
+    if started.ui:
+        await _safe_shutdown("stop_ui_bundler", stop_ui_bundler())
+    await _safe_shutdown("stop_remote_graphs", graph.stop_remote_graphs())
+    if started.http:
+        await _safe_shutdown("stop_http_client", stop_http_client())
+        await _safe_shutdown("stop_webhook_http_client", stop_webhook_http_client())
+    if started.pool:
+        await _safe_shutdown("stop_pool", stop_pool())
+
+
 @asynccontextmanager
 async def lifespan(
     app: Starlette | None = None,
@@ -35,18 +89,11 @@ async def lifespan(
     import langgraph_api.config as config
     from langgraph_api import (
         __version__,
-        _checkpointer as api_checkpointer,
         feature_flags,
         graph,
         store as api_store,
     )
     from langgraph_api.asyncio import SimpleTaskGroup, set_event_loop
-    from langgraph_api.http import (
-        start_http_client,
-        stop_http_client,
-        stop_webhook_http_client,
-    )
-    from langgraph_api.js.ui import start_ui_bundler, stop_ui_bundler
     from langgraph_api.metadata import metadata_loop
 
     from langgraph_runtime_pg import __version__ as runtime_version
@@ -80,19 +127,9 @@ async def lifespan(
             exc_info=cause,
         )
 
-    started_http = False
-    started_pool = False
-    started_checkpointer = False
-    started_ui = False
+    started = _StartedServices()
     try:
-        await start_http_client()
-        started_http = True
-        await start_pool()
-        started_pool = True
-        await api_checkpointer.start_checkpointer()
-        started_checkpointer = True
-        await start_ui_bundler()
-        started_ui = True
+        await _startup_runtime(started)
 
         async with SimpleTaskGroup(
             cancel=True,
@@ -145,50 +182,16 @@ async def lifespan(
     except graph.GraphLoadError as exc:
         _LAST_LIFESPAN_ERROR = exc
         raise
-    except asyncio.CancelledError:
+    except asyncio.CancelledError:  # NOSONAR - preserve tested shutdown semantics
         pass
     finally:
-        try:
-            await api_store.exit_store()
-        except Exception:
-            logger.debug("exit_store failed during lifespan cleanup", exc_info=True)
-        if started_checkpointer:
-            try:
-                await api_checkpointer.exit_checkpointer()
-            except Exception:
-                logger.debug("exit_checkpointer failed during lifespan cleanup", exc_info=True)
-        if started_ui:
-            try:
-                await stop_ui_bundler()
-            except Exception:
-                logger.debug("stop_ui_bundler failed during lifespan cleanup", exc_info=True)
-        try:
-            await graph.stop_remote_graphs()
-        except Exception:
-            logger.debug("stop_remote_graphs failed during lifespan cleanup", exc_info=True)
-        if started_http:
-            try:
-                await stop_http_client()
-            except Exception:
-                logger.debug("stop_http_client failed during lifespan cleanup", exc_info=True)
-            try:
-                await stop_webhook_http_client()
-            except Exception:
-                logger.debug(
-                    "stop_webhook_http_client failed during lifespan cleanup",
-                    exc_info=True,
-                )
-        if started_pool:
-            try:
-                await stop_pool()
-            except Exception:
-                logger.debug("stop_pool failed during lifespan cleanup", exc_info=True)
+        await _shutdown_runtime(started)
 
 
 async def queue_with_signal() -> None:
     try:
         await queue.queue()
-    except asyncio.CancelledError:
+    except asyncio.CancelledError:  # NOSONAR - preserve tested shutdown semantics
         pass
     except Exception as exc:
         logger.exception("Queue failed. Signaling shutdown", exc_info=exc)
