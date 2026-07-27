@@ -73,8 +73,8 @@ def _langhost_welcome(
 - 📚 API Docs: \033[36m{api_url}/docs\033[0m
 - 💬 Agent Chat UI: \033[36m{agent_chat_url}\033[0m
 
-\033[1;33m★\033[0m  If langhost helps you, a GitHub star keeps the project alive:
-   \033[1;33m{repo_url}\033[0m
+\033[1;33m★\033[0m  If langhost helps you, a \033[1;33mGitHub star\033[0m keeps the project alive:
+   \033[36m{repo_url}\033[0m
 
 Self-hosted, production-grade LangGraph Agent Server (Postgres + Redis).
 langhost {__version__}
