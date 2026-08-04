@@ -33,6 +33,33 @@ async def _seed_pending_run():
         )
 
 
+async def test_heartbeat_loop_recovers_after_transient_redis_error(monkeypatch):
+    from langgraph_runtime_pg import ops
+
+    attempts = 0
+    recovered = asyncio.Event()
+
+    async def _set_heartbeat(_run_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("transient Redis failure")
+        recovered.set()
+
+    monkeypatch.setattr(ops, "set_run_heartbeat", _set_heartbeat)
+    monkeypatch.setattr(ops, "heartbeat_refresh_interval_secs", lambda: 0.01)
+
+    task = asyncio.create_task(ops._run_heartbeat_loop(uuid.uuid4()))
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert attempts == 2
+
+
 async def test_exactly_one_claim(pg_runtime):
     from langgraph_runtime_pg import ops
     from langgraph_runtime_pg.database import connect
