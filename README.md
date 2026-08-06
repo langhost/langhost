@@ -66,15 +66,19 @@ Compatible with:
 
 ## Why langhost?
 
-| | `langgraph dev` | LangSmith Deployments | [Aegra](https://github.com/aegra/aegra) | **langhost** |
+| | [`langgraph dev`](https://docs.langchain.com/oss/python/langgraph/local-server) | [LangSmith Deployments](https://docs.langchain.com/langsmith/deployment) | [Aegra](https://github.com/aegra/aegra) | **[langhost](https://github.com/langhost/langhost)** |
 |:--|:--|:--|:--|:--|
-| **Best for** | Quick local experiments | Managed / licensed prod | Open, customizable server stack | Official server on your infra |
-| **Storage** | In-memory / local | Closed Postgres + Redis | Open Apache-2.0 Postgres + Redis | **Open MIT Postgres + Redis** |
-| **HTTP stack** | Official Agent Server | Official Agent Server | Independent FastAPI implementation | **Official `langgraph-api`** |
-| **Studio / SDK** | Yes | Yes | Yes — compatible clients | **Yes — same clients** |
-| **License key for runtime** | N/A | Often required | None (Apache-2.0) | **None (MIT)** |
+| **Best for** | Fast local iteration | Managed cloud or licensed self-host | Self-hosted prod with an open FastAPI stack | Self-hosted prod with the stock Agent Server |
+| **Persistence backend** | In-memory + local disk (`.langgraph_api`) | Postgres + Redis | Postgres + Redis | Postgres + Redis |
+| **Persistence runtime** | Proprietary (`langgraph-runtime-inmem`, Elastic-2.0) | Proprietary (licensed) | Open (Apache-2.0) | **Open (MIT, `langgraph-runtime-pg`)** |
+| **HTTP / API stack** | Official Agent Server | Official Agent Server | Independent FastAPI implementation | Official Agent Server |
+| **Official protocols & extras** | MCP, A2A, Generative UI, webhooks | MCP, A2A, Generative UI, webhooks | Core Agent Protocol; MCP / A2A coming soon | **MCP, A2A, Generative UI, webhooks** |
+| **LangGraph SDK / Studio** | Yes | Yes | Yes | Yes |
+| **Config** | `langgraph.json` | `langgraph.json` | `aegra.json` (falls back to `langgraph.json`) | `langgraph.json` |
+| **Project license** | Elastic-2.0 (runtime) | Proprietary / commercial | Apache-2.0 | **MIT** |
+| **License key for self-host** | Not required (dev) | Required (`LANGGRAPH_CLOUD_LICENSE_KEY`) | None | **None** |
 
-Official [`langgraph dev`](https://docs.langchain.com/oss/python/langgraph/local-server) is perfect for in-memory development. [Aegra](https://github.com/aegra/aegra) reimplements the Agent Protocol serving layer as an open FastAPI stack. **langhost** takes a narrower, compatibility-first approach: it keeps the stock `langgraph-api` server and replaces its closed persistence runtime, giving you the official Agent Server experience with durable state.
+Official [`langgraph dev`](https://docs.langchain.com/oss/python/langgraph/local-server) is ideal for in-memory development. [Aegra](https://github.com/aegra/aegra) reimplements the Agent Protocol serving layer as an open FastAPI stack. **langhost** keeps stock `langgraph-api` and swaps in MIT persistence — same MCP / A2A / Generative UI / webhooks, durable state, no license key.
 
 ## How it fits together
 
