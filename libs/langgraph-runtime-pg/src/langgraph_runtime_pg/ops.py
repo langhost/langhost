@@ -1163,11 +1163,18 @@ def _rewrite_control_done(event_bytes: bytes, message_bytes: bytes, run_id) -> t
 
 
 async def _stream_thread_events_loop(
-    created_queues, thread_id, seen_runs, resume_cursor, accept_fn, filter_fn
+    created_queues,
+    thread_id,
+    seen_runs,
+    resume_cursor,
+    restore_cursor,
+    accept_fn,
+    filter_fn,
 ) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
     """Subscribe-drain loop for live thread events."""
     last_subscribe_mono = 0.0
     subscribe_interval = 0.15
+    stream_manager = get_stream_manager()
     while True:
         now_mono = time.monotonic()
         last_subscribe_mono, new_qs = await _maybe_resubscribe(
@@ -1181,6 +1188,21 @@ async def _stream_thread_events_loop(
         )
         created_queues.extend(new_qs)
 
+        # The run may execute on another worker and finish before this observer's
+        # periodic DB scan discovers it. Its Pub/Sub frames are then already gone,
+        # and the local queue has nothing to replay. Registering the queue happens
+        # inside subscribe() before this Redis replay, so frames published during
+        # the restore are captured live; accept_fn removes those duplicates.
+        async for frame in _restore_discovered_run_events(
+            stream_manager,
+            new_qs,
+            thread_id,
+            restore_cursor,
+            accept_fn,
+            filter_fn,
+        ):
+            yield frame
+
         drained_any = False
         for run_id, queue in created_queues:
             async for frame in _drain_single_queue(run_id, queue, accept_fn, filter_fn):
@@ -1188,6 +1210,44 @@ async def _stream_thread_events_loop(
                 drained_any = True
 
         await asyncio.sleep(0 if drained_any else 0.02)
+
+
+async def _restore_discovered_run_events(
+    stream_manager,
+    new_queues,
+    thread_id: UUID,
+    restore_cursor: str | None,
+    accept_fn,
+    should_filter_fn,
+) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
+    """Replay Redis history for runs first observed after the stream opened."""
+    if restore_cursor is None:
+        return
+
+    from langgraph_api.utils.stream_codec import decode_stream_message
+
+    restored: list[tuple[Message, UUID]] = []
+    for run_id, _queue in new_queues:
+        if run_id == thread_id:
+            continue
+        for message in await stream_manager.restore_messages_async(
+            run_id, thread_id, restore_cursor
+        ):
+            restored.append((message, run_id))
+
+    restored.sort(key=lambda item: ms_seq_id_sort_key((item[0].id or b"").decode()))
+    for message, run_id in restored:
+        if not accept_fn(message):
+            continue
+        try:
+            decoded = decode_stream_message(message.data, channel=message.topic)
+        except (ValueError, KeyError):
+            continue
+        event_bytes, message_bytes = _rewrite_control_done(
+            decoded.event_bytes, decoded.message_bytes, run_id
+        )
+        if not should_filter_fn(event_bytes.decode("utf-8"), message_bytes):
+            yield (event_bytes, message_bytes, message.id, str(run_id))
 
 
 async def _restore_thread_events(
@@ -2238,7 +2298,13 @@ class Threads(Authenticated):
                         yield frame
 
                 async for frame in _stream_thread_events_loop(
-                    created_queues, thread_id, seen_runs, resume_cursor, _accept, filter_fn
+                    created_queues,
+                    thread_id,
+                    seen_runs,
+                    resume_cursor,
+                    restore_cursor,
+                    _accept,
+                    filter_fn,
                 ):
                     yield frame
             except WrappedHTTPException as e:
