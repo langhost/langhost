@@ -135,7 +135,7 @@ jobs:
           python-version: "3.11"
 
       - name: Sync
-        run: uv sync --group dev  # NOSONAR — editable workspace packages require build; lockfile pins deps
+        run: uv sync --group dev --group ci  # NOSONAR — editable workspace packages require build; lockfile pins deps
 
       - name: Resolve upstream SDK ref
         id: upstream
@@ -157,13 +157,15 @@ jobs:
       - name: Install upstream SDK + suite deps
         run: |
           uv build --wheel --out-dir /tmp/sdk-wheel .tests/langgraph_api/libs/sdk-py
-          uv pip install --no-build /tmp/sdk-wheel/*.whl
-          uv pip install --no-build "deepagents==0.6.12" "langchain==1.3.14"
+          # Suite dependencies are already installed from the frozen ci group.
+          # Install only the checked-out SDK wheel, then preserve this environment.
+          uv pip install --no-build --no-deps /tmp/sdk-wheel/*.whl
+          uv pip check
 
       - name: First-party unit/queue tests
         run: |
           # Truncates PG — must run before the API server holds DB connections.
-          uv run pytest \
+          uv run --no-build --no-sync pytest \
             libs/langgraph-runtime-pg/tests/test_interface.py \
             libs/langgraph-runtime-pg/tests/test_queue.py \
             libs/langhost/tests/test_cli.py \
@@ -174,7 +176,7 @@ jobs:
           ROOT="$PWD"
           INTEGRATION_DIR="$ROOT/.tests/langgraph_api/libs/sdk-py/integration"
           export LANGSERVE_GRAPHS="$(
-            uv run python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["graphs"]))' \
+            uv run --no-sync python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["graphs"]))' \
               "${INTEGRATION_DIR}/langgraph.json"
           )"
           echo "graphs: ${LANGSERVE_GRAPHS}"
@@ -183,7 +185,7 @@ jobs:
           echo "EOF" >> "$GITHUB_ENV"
           (
             cd "${INTEGRATION_DIR}"
-            exec uv run --project "${ROOT}" uvicorn langgraph_api.server:app \
+            exec uv run --no-sync --project "${ROOT}" uvicorn langgraph_api.server:app \
               --host 127.0.0.1 --port 2024 --log-level info
           ) > /tmp/langgraph-api.log 2>&1 &
           echo $! > /tmp/langgraph-api.pid
@@ -200,12 +202,12 @@ jobs:
 
       - name: First-party live-server E2E
         timeout-minutes: 8
-        run: uv run pytest libs/langgraph-runtime-pg/tests/test_e2e.py -o "timeout=60" --reruns 2 --reruns-delay 1
+        run: uv run --no-build --no-sync pytest libs/langgraph-runtime-pg/tests/test_e2e.py -o "timeout=60" --reruns 2 --reruns-delay 1
 
       - name: Upstream SDK integration tests
         timeout-minutes: 8
         run: |
-          uv run pytest .tests/langgraph_api/libs/sdk-py/tests/integration \
+          uv run --no-build --no-sync pytest .tests/langgraph_api/libs/sdk-py/tests/integration \
             -o "addopts=" -m integration --reruns 2 --reruns-delay 1
 
       - name: Stop langgraph-api

@@ -568,6 +568,89 @@ async def test_thread_stream_dash_replays_redis_when_local_buffer_empty(pg_runti
     assert events[0][1] == marker
 
 
+async def test_thread_stream_replays_redis_for_run_discovered_after_join(pg_runtime, monkeypatch):
+    """A cross-worker run may finish before the thread stream discovers it."""
+    from langgraph_api.utils.stream_codec import STREAM_CODEC
+
+    from langgraph_runtime_pg import ops
+    from langgraph_runtime_pg.database import connect
+    from langgraph_runtime_pg.redis_stream import Message, get_stream_manager
+
+    aid, tid = uuid.uuid4(), uuid.uuid4()
+    async with connect() as conn:
+        await anext(
+            await ops.Assistants.put(conn, aid, graph_id="g1", name="test", config={}, metadata={})
+        )
+        await anext(await ops.Threads.put(conn, tid))
+
+    first_subscription_done = asyncio.Event()
+    allow_next_scan = asyncio.Event()
+    original_resubscribe = ops._maybe_resubscribe
+    calls = 0
+
+    async def _controlled_resubscribe(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await allow_next_scan.wait()
+        result = await original_resubscribe(*args, **kwargs)
+        if calls == 1:
+            first_subscription_done.set()
+        return result
+
+    monkeypatch.setattr(ops, "_maybe_resubscribe", _controlled_resubscribe)
+
+    marker = b'{"v":"late-run-redis-history"}'
+    events: list[tuple[bytes, bytes]] = []
+
+    async def _drain() -> None:
+        async for event, message, _sid, _run in ops.Threads.Stream.join_event_streaming(
+            tid,
+            last_event_id="-",
+            stream_modes=["run_modes"],
+        ):
+            events.append((event, message))
+            return
+
+    task = asyncio.create_task(_drain())
+    try:
+        await asyncio.wait_for(first_subscription_done.wait(), timeout=2.0)
+        async with connect() as conn:
+            created = await anext(
+                await ops.Runs.put(
+                    conn,
+                    aid,
+                    {"config": {}},
+                    thread_id=tid,
+                    metadata={},
+                    prevent_insert_if_inflight=False,
+                )
+            )
+        rid = created["run_id"]
+        sm = get_stream_manager()
+        await sm.put(
+            rid,
+            tid,
+            Message(
+                topic=f"run:{rid}:stream".encode(),
+                data=STREAM_CODEC.encode("values", marker),
+            ),
+            resumable=True,
+        )
+        # Simulate another worker: Redis has the frame, this process does not.
+        sm.message_stores.pop(tid, None)
+        allow_next_scan.set()
+        await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        allow_next_scan.set()
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    assert events == [(b"values", marker)]
+
+
 async def test_threads_search_honors_extract(pg_runtime):
     """Threads.search must populate ``extracted`` when ``extract`` is passed."""
     from langgraph_runtime_pg import ops
