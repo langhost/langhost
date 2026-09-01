@@ -29,6 +29,12 @@ dev = [
     "mypy>=1.14",
     "pre-commit>=4.0",
 ]
+ci = [
+    # Dependencies imported by the upstream SDK integration graphs.
+    # Transitive adapters remain reproducible through the frozen uv.lock.
+    "deepagents==0.7.11",
+    "langchain==1.3.18",
+]
 
 [tool.uv.workspace]
 members = ["libs/*"]
@@ -42,8 +48,8 @@ langhost = { workspace = true }
 constraint-dependencies = [
     "langgraph-api==0.11.1",
     "langgraph-runtime-inmem==0.31.1",
-    "langgraph-sdk==0.4.2",
-    "langgraph==1.2.9",
+    "langgraph-sdk==0.4.4",
+    "langgraph==1.2.11",
     "langgraph-checkpoint==4.1.1",
     "langgraph-checkpoint-postgres==3.1.0",
 ]
