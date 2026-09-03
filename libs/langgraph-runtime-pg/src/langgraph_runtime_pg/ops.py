@@ -572,7 +572,7 @@ def _materialize_page(
     return items
 
 
-def _normalize_config_context(config: dict, context: dict) -> tuple[dict, dict]:
+def _normalize_config_context(config: dict, context: dict | None) -> tuple[dict, dict | None]:
     """Reconcile config.configurable and context; raises if both provided."""
     if config.get("configurable") and context:
         raise HTTPException(
@@ -937,7 +937,7 @@ class Assistants(Authenticated):
 
         if graph_id is not None:
             _assert_graph_exists(graph_id)
-        config, context = _normalize_config_context(config, context or {})
+        config, context = _normalize_config_context(config, context)
 
         # Lock so concurrent patches cannot allocate the same version (PK on assistant_versions).
         assistant = (
