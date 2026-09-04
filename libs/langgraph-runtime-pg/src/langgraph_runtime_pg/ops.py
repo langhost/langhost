@@ -572,7 +572,7 @@ def _materialize_page(
     return items
 
 
-def _normalize_config_context(config: dict, context: dict) -> tuple[dict, dict]:
+def _normalize_config_context(config: dict, context: dict | None) -> tuple[dict, dict | None]:
     """Reconcile config.configurable and context; raises if both provided."""
     if config.get("configurable") and context:
         raise HTTPException(
@@ -937,7 +937,7 @@ class Assistants(Authenticated):
 
         if graph_id is not None:
             _assert_graph_exists(graph_id)
-        config, context = _normalize_config_context(config, context or {})
+        config, context = _normalize_config_context(config, context)
 
         # Lock so concurrent patches cannot allocate the same version (PK on assistant_versions).
         assistant = (
@@ -2462,6 +2462,34 @@ def _build_exclude_sql(blocked_threads: list) -> tuple[str, dict]:
     return exclude_sql, params
 
 
+async def _run_heartbeat_loop(run_id: UUID) -> None:
+    """Refresh a run heartbeat until cancelled, retrying transient Redis failures."""
+    interval = heartbeat_refresh_interval_secs()
+    retry_interval = min(interval, 5.0)
+    consecutive_failures = 0
+    while True:
+        try:
+            await set_run_heartbeat(run_id)
+        except Exception:
+            consecutive_failures += 1
+            logger.exception(
+                "Run heartbeat refresh failed; retrying",
+                run_id=str(run_id),
+                consecutive_failures=consecutive_failures,
+                retry_interval=retry_interval,
+            )
+            await asyncio.sleep(retry_interval)
+            continue
+        if consecutive_failures:
+            logger.info(
+                "Run heartbeat refresh recovered",
+                run_id=str(run_id),
+                consecutive_failures=consecutive_failures,
+            )
+            consecutive_failures = 0
+        await asyncio.sleep(interval)
+
+
 async def _ensure_run_thread(
     conn: PgConnectionProto,
     thread_id: UUID | None,
@@ -3331,17 +3359,11 @@ class Runs(Authenticated):
         stream_manager = get_stream_manager()
         control_queue = await stream_manager.add_control_queue(run_id, thread_id)
 
-        async def _heartbeat_loop() -> None:
-            interval = heartbeat_refresh_interval_secs()
-            while True:
-                await set_run_heartbeat(run_id)
-                await asyncio.sleep(interval)
-
         try:
             await set_run_heartbeat(run_id)
             async with SimpleTaskGroup(cancel=True, taskgroup_name="Runs.enter") as tg:
                 done = ValueEvent()
-                tg.create_task(_heartbeat_loop())
+                tg.create_task(_run_heartbeat_loop(run_id))
                 tg.create_task(listen_for_cancellation(control_queue, run_id, thread_id, done))
                 yield done
                 control_message = Message(topic=f"run:{run_id}:control".encode(), data=b"done")
