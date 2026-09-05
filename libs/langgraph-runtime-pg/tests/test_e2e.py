@@ -86,6 +86,19 @@ async def test_deep_agent_wait_completes(async_sdk) -> None:
         await async_sdk.threads.delete(tid)
 
 
+async def test_deep_agent_subgraphs_stream_reaches_terminal(async_threads) -> None:
+    """A live projection must receive run completion, not only replay observers."""
+    threads, _ = async_threads
+    async with threads.stream(assistant_id=DEEP_AGENT_ASSISTANT_ID) as thread:
+        await thread.run.start(input=DEEP_INPUT)
+
+        async def collect_subgraphs():
+            return [handle async for handle in thread.subgraphs]
+
+        handles = await asyncio.wait_for(collect_subgraphs(), timeout=15)
+        assert handles, "deep_agent should produce at least one direct-child handle"
+
+
 async def test_tools_agent_tool_calls_channel(async_threads) -> None:
     threads, _ = async_threads
     async with threads.stream(assistant_id=TOOLS_ASSISTANT_ID) as thread:
