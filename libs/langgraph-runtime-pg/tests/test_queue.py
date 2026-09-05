@@ -540,6 +540,39 @@ async def test_pubsub_fanout_across_managers(pg_runtime):
     await client_b.aclose()
 
 
+async def test_control_and_stream_messages_with_same_id_both_fan_out(pg_runtime):
+    """Control and stream lanes may independently generate the same entry ID."""
+    from langgraph_api.utils.stream_codec import STREAM_CODEC
+
+    from langgraph_runtime_pg.redis_stream import Message, get_stream_manager
+
+    sm = get_stream_manager()
+    run_id, thread_id = uuid.uuid4(), uuid.uuid4()
+    run_queue = await sm.add_queue(run_id, thread_id, replay=False)
+    control_queue = await sm.add_control_queue(run_id, thread_id)
+    shared_id = b"1234567890000-0"
+    raw_control = Message(
+        topic=f"run:{run_id}:control".encode(),
+        data=b"done",
+        id=shared_id,
+    )
+    stream_control = Message(
+        topic=f"run:{run_id}:stream".encode(),
+        data=STREAM_CODEC.encode("control", b"done"),
+        id=shared_id,
+    )
+
+    try:
+        await sm._deliver_local(thread_id, run_id, raw_control, control=True)
+        await sm._deliver_local(thread_id, run_id, stream_control, control=False)
+
+        assert await asyncio.wait_for(control_queue.get(), timeout=1) is raw_control
+        assert await asyncio.wait_for(run_queue.get(), timeout=1) is stream_control
+    finally:
+        await sm.remove_control_queue(run_id, thread_id, control_queue)
+        await sm.remove_queue(run_id, thread_id, run_queue)
+
+
 async def test_thread_stream_dash_replays_redis_when_local_buffer_empty(pg_runtime):
     """Join with last_event_id='-' must replay from Redis when local buffer is empty."""
     from langgraph_api.utils.stream_codec import STREAM_CODEC
