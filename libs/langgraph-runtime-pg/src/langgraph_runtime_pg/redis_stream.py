@@ -405,7 +405,16 @@ class StreamManager:
         already_locked: bool = False,
     ) -> None:
         async def _do() -> None:
-            if not self._mark_seen(f"run:{thread_id}:{run_id}", message):
+            # Control messages and resumable stream messages use independent
+            # ID generators. At run completion the raw ``control/done`` and
+            # encoded stream ``control/done`` are published back-to-back, so
+            # both can legitimately receive the same millisecond-sequence ID.
+            # Deduplicating across those lanes drops the stream completion and
+            # leaves live Protocol v3 projections waiting forever. Keep dedup
+            # within each delivery lane; Redis Pub/Sub echoes still collapse,
+            # while the distinct control and stream messages both fan out.
+            lane = "control" if control else "stream"
+            if not self._mark_seen(f"run:{thread_id}:{run_id}:{lane}", message):
                 return
             if control:
                 self.control_keys[thread_id][run_id] = message
