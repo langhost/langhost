@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Any
 
+import uvicorn
+
 from langhost import cli as cli_module
 
 
@@ -68,3 +70,20 @@ def test_serve_passes_resolved_port_to_banner_and_server(
     assert calls["resolved"] == ("127.0.0.1", 31296)
     assert calls["welcome"]["port"] == 51234
     assert calls["server"] == ("127.0.0.1", 51234)
+
+
+def test_runtime_compat_uses_langhost_asgi_entrypoint(monkeypatch: Any) -> None:
+    calls: dict[str, str] = {}
+
+    def upstream_run_server() -> None:
+        uvicorn.run(cli_module._UPSTREAM_APP_TARGET)
+
+    def uvicorn_run(app: str, *_args: Any, **_kwargs: Any) -> None:
+        calls["app"] = app
+
+    monkeypatch.setattr(cli_module, "run_server", upstream_run_server)
+    monkeypatch.setattr(uvicorn, "run", uvicorn_run)
+
+    cli_module._run_server_with_lifespan_compat()
+
+    assert calls["app"] == cli_module._LANGHOST_APP_TARGET

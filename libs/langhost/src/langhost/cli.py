@@ -8,8 +8,10 @@ import pathlib
 import sys
 from collections.abc import Sequence
 from typing import Any, cast
+from unittest.mock import patch
 
 import click
+import uvicorn
 from dotenv import load_dotenv
 from langgraph_api.cli import _resolve_port, run_server
 from langgraph_cli.config import validate_config_file
@@ -26,6 +28,8 @@ DEFAULT_STUDIO_ORIGIN = "https://smith.langchain.com"
 
 # Upstream run_server always logs an inmem-oriented welcome; replace it for langhost.
 _UPSTREAM_WELCOME_MARKER = "This in-memory server is designed for development and testing"
+_UPSTREAM_APP_TARGET = "langgraph_api.server:app"
+_LANGHOST_APP_TARGET = "langhost.server:app"
 
 
 def _display_host(host: str) -> str:
@@ -151,6 +155,19 @@ def _build_uvicorn_kwargs(workers: int) -> dict[str, Any]:
     if workers > 1:
         uvicorn_kwargs["workers"] = workers
     return uvicorn_kwargs
+
+
+def _run_server_with_lifespan_compat(*args: Any, **kwargs: Any) -> None:
+    """Run the upstream CLI with LangHost's ASGI entrypoint."""
+    original_run = uvicorn.run
+
+    def run(app: str, *uvicorn_args: Any, **uvicorn_kwargs: Any) -> Any:
+        if app == _UPSTREAM_APP_TARGET:
+            app = _LANGHOST_APP_TARGET
+        return original_run(app, *uvicorn_args, **uvicorn_kwargs)
+
+    with patch.object(uvicorn, "run", run):
+        run_server(*args, **kwargs)
 
 
 def _resolve_mount_prefix(config_json: dict[str, Any]) -> tuple[dict | None, str | None]:
@@ -362,7 +379,7 @@ def serve(
     banner_filter = _ReplaceWelcomeBanner(welcome)
     api_cli_logger.addFilter(banner_filter)
     try:
-        run_server(
+        _run_server_with_lifespan_compat(
             host,
             port,
             reload,
