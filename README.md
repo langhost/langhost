@@ -58,7 +58,7 @@ naturally and does not interrupt their task.
 
 **langhost** is the open way to run a production-grade [LangGraph Agent Server](https://docs.langchain.com/langsmith/agent-server) on **your** Postgres and Redis — no closed runtime, no license key for persistence.
 
-It is **100% compatible** with the LangGraph ecosystem. Existing LangGraph projects (with a normal `langgraph.json`) should run **without any code changes**: add `langhost`, point at Postgres + Redis, and serve.
+It keeps the stock Agent Server API and replaces its persistence runtime. Existing LangGraph projects (with a normal `langgraph.json`) can keep their graph code: add `langhost`, point at Postgres + Redis, and serve. Compatibility is validated against a pinned upstream set; see the [supported versions and protocol matrix](docs/compatibility.md) before upgrading dependencies.
 
 Compatible with:
 
@@ -202,6 +202,12 @@ Same SDK. Same endpoints. Same Studio. Fully self-hosted.
 - **Ecosystem protocols** — Agent Protocol (LangChain), plus MCP / A2A surfaces from the stock server
 - **Horizontal scale** — multi-replica claim/reclaim on Postgres + Redis
 - **First-party checkpoints** — via `langgraph-checkpoint-postgres`
+
+## Supported versions and streaming
+
+The [compatibility matrix](docs/compatibility.md) records the exact tested Agent Server, SDK, and LangGraph versions, protocol coverage, and upgrade policy. CI validates that table against `uv.lock`, and each release includes a copy from its tag.
+
+The pinned API includes both `POST /threads/{thread_id}/commands` and `POST /threads/{thread_id}/stream/events`. Tests cover remote tools, nested subgraphs, interrupt/resume, and reconnecting with a `since` cursor. SDK `runs.stream(version="v2", stream_subgraphs=True)` is tested separately: its `version` selects the SDK output shape, not the thread event protocol.
 
 ## Migrations
 
