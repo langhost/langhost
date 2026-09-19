@@ -1,7 +1,10 @@
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
+import pytest
 import uvicorn
+from langgraph_api import cli as upstream_cli
 
 from langhost import cli as cli_module
 
@@ -72,18 +75,58 @@ def test_serve_passes_resolved_port_to_banner_and_server(
     assert calls["server"] == ("127.0.0.1", 51234)
 
 
-def test_runtime_compat_uses_langhost_asgi_entrypoint(monkeypatch: Any) -> None:
-    calls: dict[str, str] = {}
+@pytest.mark.parametrize(("workers", "reload"), [(1, False), (4, False), (1, True)])
+def test_runtime_compat_preserves_upstream_uvicorn_options(
+    monkeypatch: pytest.MonkeyPatch, workers: int, reload: bool
+) -> None:
+    calls: dict[str, Any] = {}
 
-    def upstream_run_server() -> None:
-        uvicorn.run(cli_module._UPSTREAM_APP_TARGET)
+    # Keep the real signature: upstream filters kwargs using inspect.signature.
+    @wraps(uvicorn.run)
+    def uvicorn_run(app: str, *args: Any, **kwargs: Any) -> None:
+        calls.update(app=app, args=args, kwargs=kwargs)
 
-    def uvicorn_run(app: str, *_args: Any, **_kwargs: Any) -> None:
-        calls["app"] = app
-
-    monkeypatch.setattr(cli_module, "run_server", upstream_run_server)
     monkeypatch.setattr(uvicorn, "run", uvicorn_run)
+    monkeypatch.setattr(upstream_cli, "_resolve_port", lambda _host, port: port)
+    monkeypatch.setenv("LANGGRAPH_NO_VERSION_CHECK", "true")
 
-    cli_module._run_server_with_lifespan_compat()
+    # Exercise the real upstream run_server, including its kwarg filtering.
+    cli_module._run_server_with_lifespan_compat(
+        "127.0.0.1",
+        51234,
+        reload,
+        {},
+        workers=workers,
+        lifespan="on",
+        timeout_graceful_shutdown=5,
+        reload_includes=["*.py"],
+        studio_url="https://smith.langchain.com",
+        runtime_edition="pg",
+        __database_uri__="postgresql://example",
+        __redis_uri__="redis://example",
+    )
 
     assert calls["app"] == cli_module._LANGHOST_APP_TARGET
+    assert calls["args"] == ()
+    assert calls["kwargs"]["workers"] == workers
+    assert calls["kwargs"]["lifespan"] == "on"
+    assert calls["kwargs"]["timeout_graceful_shutdown"] == 5
+    assert calls["kwargs"]["reload"] is reload
+    assert calls["kwargs"]["reload_includes"] == ["*.py"]
+    assert calls["kwargs"]["port"] == 51234
+    assert uvicorn.run is uvicorn_run
+
+
+def test_runtime_compat_restores_uvicorn_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_run = uvicorn.run
+
+    def fail() -> None:
+        assert uvicorn.run is not original_run
+        raise RuntimeError("server startup failed")
+
+    monkeypatch.setattr(cli_module, "run_server", fail)
+
+    with pytest.raises(RuntimeError, match="server startup failed"):
+        cli_module._run_server_with_lifespan_compat()
+
+    assert uvicorn.run is original_run

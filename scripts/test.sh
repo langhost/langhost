@@ -128,7 +128,7 @@ echo "==> tests (wall-clock budget ${E2E_DEADLINE_SECS}s for pytest+server+SDK)"
   uv run pytest -q \
     libs/langgraph-runtime-pg/tests/test_interface.py \
     libs/langgraph-runtime-pg/tests/test_queue.py \
-    libs/langhost/tests/test_cli.py \
+    libs/langhost/tests \
     --tb=short
 
   echo "==> start langgraph-api (edition=pg) on ${BASE_URL}"

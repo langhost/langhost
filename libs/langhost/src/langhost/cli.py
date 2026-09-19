@@ -7,6 +7,7 @@ import os
 import pathlib
 import sys
 from collections.abc import Sequence
+from functools import wraps
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -161,6 +162,8 @@ def _run_server_with_lifespan_compat(*args: Any, **kwargs: Any) -> None:
     """Run the upstream CLI with LangHost's ASGI entrypoint."""
     original_run = uvicorn.run
 
+    # Upstream filters extra options against inspect.signature(uvicorn.run).
+    @wraps(original_run)
     def run(app: str, *uvicorn_args: Any, **uvicorn_kwargs: Any) -> Any:
         if app == _UPSTREAM_APP_TARGET:
             app = _LANGHOST_APP_TARGET
