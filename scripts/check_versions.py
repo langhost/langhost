@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""After `uv lock --check`, verify lockstep versions in uv.lock."""
+"""After `uv lock --check`, verify lockstep versions and the compatibility matrix."""
 
 from __future__ import annotations
 
@@ -21,6 +21,22 @@ def main() -> None:
         raise SystemExit(f"lockstep: runtime-pg={runtime!r} langhost={langhost!r}")
     if runtime.split(".post")[0] != api:
         raise SystemExit(f"{runtime!r} base != langgraph-api=={api}")
+
+    matrix = (ROOT / "docs/compatibility.md").read_text()
+    for name in (
+        "langhost",
+        "langgraph-runtime-pg",
+        "langgraph-api",
+        "langgraph-sdk",
+        "langgraph",
+        "langgraph-checkpoint",
+        "langgraph-checkpoint-postgres",
+        "langchain-core",
+        "langchain",
+        "deepagents",
+    ):
+        if f"| `{name}` | `{pkgs[name]}` |" not in matrix:
+            raise SystemExit(f"docs/compatibility.md must record {name}=={pkgs[name]} from uv.lock")
 
     root_license = (ROOT / "LICENSE").read_text()
     for rel in (
