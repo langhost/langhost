@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
+import httpx
 import pytest
+from langgraph_sdk.sse import SSEDecoder
 
 pytestmark = pytest.mark.e2e
 
@@ -183,6 +186,186 @@ async def test_stream_values_then_interrupt(async_sdk) -> None:
         assert events, "expected at least one values stream event"
         runs = await async_sdk.runs.list(tid, limit=1)
         assert runs[0]["status"] in {"interrupted", "success", "pending", "running"}
+    finally:
+        await async_sdk.threads.delete(tid)
+
+
+@pytest.mark.parametrize("stream_subgraphs", [False, True])
+async def test_runs_stream_v2_interrupt_resume_and_subgraphs(async_sdk, stream_subgraphs) -> None:
+    """SDK v2 dictionaries preserve interrupts and optionally expose child namespaces."""
+    thread = await async_sdk.threads.create()
+    tid = thread["thread_id"]
+    options = {
+        "version": "v2",
+        "stream_mode": ["values", "updates"],
+        "stream_subgraphs": stream_subgraphs,
+    }
+    try:
+        interrupted = [
+            part
+            async for part in async_sdk.runs.stream(tid, ASSISTANT_ID, input=AGENT_INPUT, **options)
+        ]
+        root_values = [part for part in interrupted if part["type"] == "values" and not part["ns"]]
+        assert root_values[-1]["interrupts"][0]["value"] == "Are we good?"
+        assert "__interrupt__" not in root_values[-1]["data"]
+
+        resumed = [
+            part
+            async for part in async_sdk.runs.stream(
+                tid, ASSISTANT_ID, command={"resume": "yes"}, **options
+            )
+        ]
+        for part in interrupted + resumed:
+            assert {"type", "ns", "data", "interrupts"} <= part.keys()
+            assert isinstance(part["ns"], list)
+            assert all(isinstance(segment, str) for segment in part["ns"])
+            assert isinstance(part["interrupts"], list)
+        final = [part for part in resumed if part["type"] == "values" and not part["ns"]][-1]
+        assert final["data"]["items"] == EXPECTED_TERMINAL_ITEMS
+        assert final["interrupts"] == []
+
+        children = [part for part in resumed if part["ns"]]
+        if stream_subgraphs:
+            assert children, "stream_subgraphs=True must include the nested graph"
+            assert all(part["ns"][0].startswith("run_subgraph:") for part in children)
+            assert {part["type"] for part in children} >= {"values", "updates"}
+            assert any(
+                part["type"] == "values" and part["data"].get("note") == "ran" for part in children
+            )
+        else:
+            assert children == []
+        runs = await async_sdk.runs.list(tid, limit=1)
+        assert runs[0]["status"] == "success"
+    finally:
+        await async_sdk.threads.delete(tid)
+
+
+def _is_lifecycle(event: dict, name: str, namespace: list[str]) -> bool:
+    return (
+        event["method"] == "lifecycle"
+        and event["params"]["namespace"] == namespace
+        and event["params"]["data"].get("event") == name
+    )
+
+
+async def _read_protocol_until(
+    response: httpx.Response, until: Callable[[dict], bool]
+) -> list[dict]:
+    response.raise_for_status()
+    assert response.headers["content-type"].startswith("text/event-stream")
+    decoder = SSEDecoder()
+    events = []
+    async for line in response.aiter_lines():
+        part = decoder.decode(line.encode())
+        if part is None or not part.event:  # Ignore SSE keepalive comments.
+            continue
+        event = part.data
+        assert part.event == event["method"]
+        assert isinstance(event["seq"], int)
+        assert part.id == str(event["seq"])
+        assert event["event_id"]
+        assert isinstance(event["params"]["namespace"], list)
+        events.append(event)
+        if until(event):
+            return events
+    pytest.fail("event stream closed before the expected lifecycle event")
+
+
+@pytest.mark.timeout(45)
+async def test_protocol_events_since_reconnect_preserves_nested_history(
+    async_sdk, async_threads
+) -> None:
+    """Reconnect with a real seq cursor, then compare against unfiltered history."""
+    _, raw = async_threads
+    thread = await async_sdk.threads.create()
+    tid = thread["thread_id"]
+    path = f"/threads/{tid}/stream/events"
+    channels = ["values", "messages", "tools", "lifecycle"]
+
+    def root_terminal(event: dict) -> bool:
+        return any(
+            _is_lifecycle(event, name, []) for name in ("completed", "failed", "interrupted")
+        )
+
+    def identity(event: dict) -> tuple:
+        return event["seq"], event["event_id"], event["method"], event["params"]["namespace"]
+
+    try:
+        # Subscribe before starting so this exercises both live delivery and replay.
+        async with raw.stream("POST", path, json={"channels": channels}, timeout=15) as response:
+            response.raise_for_status()
+            command = await raw.post(
+                f"/threads/{tid}/commands",
+                json={
+                    "id": 1,
+                    "method": "run.start",
+                    "params": {"assistant_id": DEEP_AGENT_ASSISTANT_ID, "input": DEEP_INPUT},
+                },
+            )
+            command.raise_for_status()
+            result = command.json()
+            assert result["type"] == "success", result
+            assert result["id"] == 1
+            rid = result["result"]["run_id"]
+            prefix = await _read_protocol_until(
+                response,
+                lambda event: (
+                    bool(event["params"]["namespace"])
+                    and _is_lifecycle(event, "started", event["params"]["namespace"])
+                ),
+            )
+
+        cursor = prefix[-1]["seq"]
+        namespace = prefix[-1]["params"]["namespace"]
+        # The client is disconnected while waiting for the run to finish. Replay
+        # must recover the remaining child events even if the graph finishes fast.
+        await async_sdk.runs.join(tid, rid)
+        assert (await async_sdk.runs.get(tid, rid))["status"] == "success"
+        async with raw.stream(
+            "POST", path, json={"channels": channels, "since": cursor}, timeout=15
+        ) as response:
+            resumed = await _read_protocol_until(response, root_terminal)
+        assert _is_lifecycle(resumed[-1], "completed", [])
+        assert all(event["seq"] > cursor for event in resumed)
+        assert any(_is_lifecycle(event, "completed", namespace) for event in resumed)
+
+        async with raw.stream(
+            "POST", path, json={"channels": channels, "since": 0}, timeout=15
+        ) as response:
+            reference = await _read_protocol_until(response, root_terminal)
+        combined = prefix + resumed
+        assert [identity(event) for event in combined] == [identity(event) for event in reference]
+        sequences = [event["seq"] for event in combined]
+        assert sequences == sorted(set(sequences)), (
+            "cursor resume must not duplicate or reorder events"
+        )
+        assert len({event["event_id"] for event in combined}) == len(combined)
+        assert {event["method"] for event in reference} >= set(channels)
+
+        # Cursor semantics must also hold when subscribing to one child namespace.
+        selected_channels = ["values", "lifecycle"]
+        async with raw.stream(
+            "POST",
+            path,
+            json={
+                "channels": selected_channels,
+                "since": cursor,
+                "namespaces": [namespace],
+                "depth": 0,
+            },
+            timeout=15,
+        ) as response:
+            selected = await _read_protocol_until(
+                response, lambda event: _is_lifecycle(event, "completed", namespace)
+            )
+        expected = [
+            event
+            for event in reference
+            if event["seq"] > cursor
+            and event["method"] in selected_channels
+            and event["params"]["namespace"] == namespace
+        ]
+        assert [identity(event) for event in selected] == [identity(event) for event in expected]
     finally:
         await async_sdk.threads.delete(tid)
 
