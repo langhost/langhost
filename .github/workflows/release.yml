@@ -54,6 +54,7 @@ jobs:
           rm -rf dist
           uv build --package langgraph-runtime-pg
           uv build --package langhost
+          cp docs/compatibility.md dist/COMPATIBILITY.md
           ls -la dist
 
       - name: Smoke import wheels
@@ -143,6 +144,7 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"
           gh release create "${GITHUB_REF_NAME}" \
             --title "v${VER}" \
+            --notes-file dist/COMPATIBILITY.md \
             --generate-notes \
             --repo "${{ github.repository }}" \
             dist/*

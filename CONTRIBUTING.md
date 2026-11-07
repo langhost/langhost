@@ -60,7 +60,7 @@ uv run pytest -q libs/langgraph-runtime-pg/tests
 Both packages ship in **lockstep** (`langhost` and `langgraph-runtime-pg` share the same version).
 
 1. Bump both package versions in their `pyproject.toml` files (and the `langhost` → `langgraph-runtime-pg==…` pin).
-2. Run `uv lock` and `python3 scripts/check_versions.py`.
+2. Run `uv lock`, update the tested versions and coverage in `docs/compatibility.md`, and run `python3 scripts/check_versions.py`.
 3. Merge to `main`.
 4. Tag and push (tag must match the version, with a `v` prefix):
 
@@ -69,7 +69,17 @@ Both packages ship in **lockstep** (`langhost` and `langgraph-runtime-pg` share 
    git push origin v0.11.1.post4
    ```
 
-5. The **Release** workflow builds, publishes both packages to **PyPI** (Trusted Publishing / OIDC), and creates a GitHub Release.
+5. The **Release** workflow builds, publishes both packages to **PyPI** (Trusted Publishing / OIDC), and creates a GitHub Release with the tag's compatibility matrix in its notes and assets.
+
+### Upgrading upstream dependencies
+
+Follow the [Agent Server upgrade policy](docs/compatibility.md#upstream-upgrade-policy).
+Keep the API pin exact and evaluate new API versions in a dedicated PR branch.
+Record runtime interface changes, migration requirements, and any remaining
+incompatibilities in the PR. Update the compatibility matrix with the frozen
+dependency set and actual test coverage. An upgrade must pass the first-party
+Postgres + Redis tests and the upstream SDK integration suite, including the SDK
+v2 and nested cursor-reconnect regressions, before merging or releasing.
 
 ### One-time PyPI + GitHub setup
 
@@ -79,4 +89,3 @@ Both packages ship in **lockstep** (`langhost` and `langgraph-runtime-pg` share 
   - `langgraph-runtime-pg` → environment `pypi-runtime`
 - Protect `main`: require the **Lint**, **Build**, and **Test** status checks before merge.
 - The Release workflow runs the full CI suite first; each package publishes only after CI is green and its environment is approved.
-
