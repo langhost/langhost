@@ -646,6 +646,97 @@ def _thread_where_clauses(metadata, values, status) -> list:
     return clauses
 
 
+async def _checkpoint_storage(conn: PgConnectionProto, thread_id: str) -> dict[str, Any]:
+    """Sum checkpoint table bytes for one thread. Missing tables yield zeros."""
+    from sqlalchemy.exc import ProgrammingError
+
+    try:
+        checkpoints = (
+            await conn.session.execute(
+                text(
+                    """
+                    SELECT count(*)::int,
+                           coalesce(sum(
+                               pg_column_size(checkpoint)
+                               + coalesce(pg_column_size(metadata), 0)
+                           ), 0)::bigint
+                    FROM checkpoints
+                    WHERE thread_id = :tid
+                    """
+                ),
+                {"tid": thread_id},
+            )
+        ).one()
+        channels = (
+            await conn.session.execute(
+                text(
+                    """
+                    SELECT channel,
+                           count(*)::int,
+                           coalesce(sum(pg_column_size(blob)), 0)::bigint
+                    FROM checkpoint_blobs
+                    WHERE thread_id = :tid
+                    GROUP BY channel
+                    """
+                ),
+                {"tid": thread_id},
+            )
+        ).all()
+        writes = (
+            await conn.session.execute(
+                text(
+                    """
+                    SELECT count(*)::int,
+                           coalesce(sum(pg_column_size(blob)), 0)::bigint
+                    FROM checkpoint_writes
+                    WHERE thread_id = :tid
+                    """
+                ),
+                {"tid": thread_id},
+            )
+        ).one()
+    except ProgrammingError:
+        await conn.session.rollback()
+        return {
+            "total_bytes": 0,
+            "checkpoints": {"count": 0, "bytes": 0},
+            "channel_values": {"count": 0, "bytes": 0, "by_channel": {}},
+            "pending_writes": {"count": 0, "bytes": 0},
+        }
+
+    by_channel = {
+        channel: {"versions": int(count), "bytes": int(nbytes)}
+        for channel, count, nbytes in channels
+    }
+    checkpoint_count = int(checkpoints[0])
+    checkpoint_bytes = int(checkpoints[1])
+    channel_bytes = sum(entry["bytes"] for entry in by_channel.values())
+    write_count = int(writes[0])
+    write_bytes = int(writes[1])
+    return {
+        "total_bytes": checkpoint_bytes + channel_bytes + write_bytes,
+        "checkpoints": {"count": checkpoint_count, "bytes": checkpoint_bytes},
+        "channel_values": {
+            "count": sum(entry["versions"] for entry in by_channel.values()),
+            "bytes": channel_bytes,
+            "by_channel": by_channel,
+        },
+        "pending_writes": {"count": write_count, "bytes": write_bytes},
+    }
+
+
+def _exclude_metadata_clauses(exclude_metadata: list[dict] | None) -> list:
+    """Drop threads whose metadata contains any of the given objects.
+
+    An empty object contains every JSON object, so those entries are ignored.
+    """
+    clauses = []
+    for excluded in exclude_metadata or []:
+        if isinstance(excluded, dict) and excluded:
+            clauses.append(~ThreadRow.metadata_.contains(excluded))
+    return clauses
+
+
 def _cron_where_clauses(assistant_id, thread_id, metadata) -> list:
     clauses = []
     if assistant_id is not None:
@@ -1401,6 +1492,7 @@ class Threads(Authenticated):
         sort_order: str | None = None,
         select: list | None = None,
         extract: dict | None = None,
+        exclude_metadata: list[dict] | None = None,
         ctx: Any = None,
     ) -> tuple[AsyncIterator, int | None]:
         from langgraph_sdk import Auth
@@ -1428,6 +1520,8 @@ class Threads(Authenticated):
             q = q.where(ThreadRow.values_.contains(values))
         if status:
             q = q.where(ThreadRow.status == status)
+        for clause in _exclude_metadata_clauses(exclude_metadata):
+            q = q.where(clause)
         plain = _plain_metadata_filter(filters)
         if plain:
             q = q.where(ThreadRow.metadata_.contains(plain))
@@ -1488,6 +1582,22 @@ class Threads(Authenticated):
             yield d
 
         return _yield()
+
+    @staticmethod
+    async def storage(
+        conn: PgConnectionProto,
+        thread_id: UUID | str,
+        ctx: Any = None,
+    ) -> dict[str, Any]:
+        """Bytes a thread's checkpoints occupy, per table and per channel.
+
+        Same shape the in-memory runtime reports. Raises 404 when the thread
+        is missing or hidden by auth. Missing checkpoint tables (custom
+        checkpointer) report zeros.
+        """
+        thread_id = _ensure_uuid(thread_id)
+        await anext(await Threads.get(conn, thread_id, ctx=ctx))
+        return await _checkpoint_storage(conn, str(thread_id))
 
     @staticmethod
     async def put(
@@ -1815,6 +1925,7 @@ class Threads(Authenticated):
         metadata: dict | None = None,
         values: dict | None = None,
         status: str | None = None,
+        exclude_metadata: list[dict] | None = None,
         ctx: Any = None,
     ) -> int:
         from langgraph_sdk import Auth
@@ -1833,6 +1944,7 @@ class Threads(Authenticated):
             ),
         )
         clauses = _thread_where_clauses(metadata, values, status)
+        clauses.extend(_exclude_metadata_clauses(exclude_metadata))
         return await _count_with_auth(conn, ThreadRow, clauses, filters)
 
     @staticmethod
@@ -2177,10 +2289,45 @@ class Threads(Authenticated):
             metadata: dict | None = None,
             ctx: Any = None,
         ) -> list:
+            """History as a list. Kept for callers that predate ``iterate``."""
+            return [
+                state
+                async for state in Threads.State.iterate(
+                    conn,
+                    config=config,
+                    limit=limit,
+                    before=before,
+                    metadata=metadata,
+                    ctx=ctx,
+                )
+            ]
+
+        @staticmethod
+        async def iterate(
+            conn: PgConnectionProto,
+            *,
+            config: dict,
+            limit: int = 1,
+            before: Any = None,
+            metadata: dict | None = None,
+            ctx: Any = None,
+            incremental: bool = False,
+            channels: Sequence[str] | None = None,
+        ) -> AsyncIterator[StateSnapshot]:
+            """Yield thread history.
+
+            ``incremental`` loads checkpoints in growing pages so a caller that
+            stops early does not materialize the rest of ``limit``. ``channels``
+            is accepted for parity with the gRPC runtime; this checkpointer
+            loads whole checkpoints.
+            """
+            from contextlib import aclosing
+
             from langgraph_api.graph import get_graph
             from langgraph_api.store import get_store
             from langgraph_api.utils import fetchone
 
+            del channels
             thread_id = _ensure_uuid(config["configurable"]["thread_id"])
             thread = await fetchone(await Threads.get(conn, thread_id, ctx=ctx))
             thread_metadata = thread.get("metadata") or {}
@@ -2194,7 +2341,7 @@ class Threads(Authenticated):
             }
             graph_id = thread_metadata.get("graph_id")
             if not graph_id:
-                return []
+                return
 
             checkpointer = await _get_checkpointer()
             async with get_graph(
@@ -2209,12 +2356,23 @@ class Threads(Authenticated):
                     if isinstance(before, str)
                     else before
                 )
-                return [
-                    state
-                    async for state in graph.aget_state_history(
+                if incremental:
+                    from langgraph_api.state import iter_state_history
+
+                    history = iter_state_history(
+                        graph,
+                        config,
+                        limit=limit,
+                        filter=metadata,
+                        before=before_param,
+                    )
+                else:
+                    history = graph.aget_state_history(
                         config, limit=limit, filter=metadata, before=before_param
                     )
-                ]
+                async with aclosing(history) as states:
+                    async for state in states:
+                        yield state
 
     class Stream(Authenticated):
         resource = "threads"
@@ -2269,9 +2427,15 @@ class Threads(Authenticated):
             last_event_id: str | None = None,
             stream_modes: list | None = None,
             ctx: Any = None,
+            auth_filters: Any = None,
         ) -> AsyncIterator[tuple[bytes, bytes, bytes | None, str | None]]:
-            """Stream thread output (Protocol v3)."""
-            await Threads.Stream.check_thread_stream_auth(thread_id, ctx)
+            """Stream thread output (Protocol v3).
+
+            ``auth_filters`` comes from a ``check_thread_stream_auth`` the
+            caller already ran. ``None`` means this method runs the check.
+            """
+            if auth_filters is None:
+                await Threads.Stream.check_thread_stream_auth(thread_id, ctx)
 
             stream_modes = list(stream_modes or [])
             stream_manager = get_stream_manager()
@@ -2328,7 +2492,12 @@ class Threads(Authenticated):
         async def check_thread_stream_auth(
             thread_id: UUID,
             ctx: Any = None,
-        ) -> None:
+        ) -> dict:
+            """Raise 404 when the caller cannot read ``thread_id``.
+
+            Returns the auth filters so ``join_event_streaming`` can skip a
+            second handler call.
+            """
             from langgraph_sdk import Auth
 
             async with connect() as conn:
@@ -2344,6 +2513,7 @@ class Threads(Authenticated):
                         thread = None
                     if not thread or not _check_filter_match(thread.get("metadata") or {}, filters):
                         raise HTTPException(status_code=404, detail="Thread not found")
+            return filters or {}
 
 
 async def _sweep_single_run(sf, run_id: UUID, retry_counter, max_retries: int) -> bool:
@@ -2739,12 +2909,14 @@ def _resolve_cancel_statuses(status: str) -> list[str]:
     )
 
 
-async def _cancel_candidates_loop(session, candidates, action, sm, now) -> tuple[set, bool]:
+async def _cancel_candidates_loop(
+    session, candidates, action, sm, now, reason: str | None = None
+) -> tuple[set, bool]:
     """Process each candidate run; return (affected thread IDs, cancelled_any)."""
     affected_threads: set = set()
     cancelled_any = False
     for r in candidates:
-        result = await _cancel_single_run(session, r, action, sm, now)
+        result = await _cancel_single_run(session, r, action, sm, now, reason)
         if result is None:
             continue
         cancelled_any = True
@@ -2769,7 +2941,7 @@ async def _filter_cancel_candidates(session, candidates: list, filters) -> list:
 
 
 async def _cancel_single_run(
-    session, run_row, action: str, sm, now: datetime
+    session, run_row, action: str, sm, now: datetime, reason: str | None = None
 ) -> tuple[UUID | None, bool] | None:
     """Lock and cancel a single run. Returns (thread_id, was_pending) or None if skipped."""
     locked = (
@@ -2789,6 +2961,7 @@ async def _cancel_single_run(
     control = Message(
         topic=f"run:{locked.run_id}:control".encode(),
         data=action.encode(),
+        reason=reason,
     )
     await sm.put(locked.run_id, run_thread_id, control)
     queues = sm.get_queues(locked.run_id, run_thread_id)
@@ -2799,6 +2972,8 @@ async def _cancel_single_run(
     else:
         locked.status = "interrupted"
         locked.updated_at = now
+        if reason is not None:
+            locked.cancel_reason = reason
     if was_pending and not queues:
         try:
             await sm.clear_run_buffers(locked.run_id, run_thread_id, local_grace_secs=0.0)
@@ -2915,6 +3090,7 @@ async def _insert_run_row(
     multitask_strategy,
     after_seconds,
     user_id,
+    langsmith_session_name: str | None = None,
 ) -> dict:
     """Build merged configurable, create RunRow, flush, and return dict."""
     configurable = _build_run_configurable(
@@ -2951,6 +3127,7 @@ async def _insert_run_row(
             },
         },
         multitask_strategy=multitask_strategy,
+        langsmith_session_name=langsmith_session_name,
         updated_at=datetime.now(UTC),
     )
     conn.session.add(row)
@@ -3122,6 +3299,7 @@ class Runs(Authenticated):
             multitask_strategy,
             after_seconds,
             user_id,
+            langsmith_session_name,
         )
 
         if (status or "pending") == "pending":
@@ -3207,6 +3385,7 @@ class Runs(Authenticated):
         status: str | None = None,
         assistant_id: UUID | None = None,
         ctx: Any = None,
+        reason: str | None = None,
     ) -> None:
         from langgraph_sdk import Auth
 
@@ -3237,7 +3416,7 @@ class Runs(Authenticated):
         sm = get_stream_manager()
         now = datetime.now(UTC)
         affected_threads, cancelled_any = await _cancel_candidates_loop(
-            conn.session, candidates, action, sm, now
+            conn.session, candidates, action, sm, now, reason
         )
         await conn.session.flush()
 
@@ -3250,6 +3429,44 @@ class Runs(Authenticated):
                 await wake_run_queue()
             except Exception:
                 logger.debug("wake_run_queue after cancel failed", exc_info=True)
+
+    @staticmethod
+    async def cancel_accepted_before(
+        conn: PgConnectionProto,
+        accepted_before: datetime,
+        *,
+        reason: str,
+    ) -> dict[str, int]:
+        """Interrupt in-flight runs created at or before ``accepted_before``.
+
+        No auth filters: only the operator route calls this. Runs this runtime
+        finalizes immediately leave both counters at zero.
+        """
+        q = sa_select(RunRow).where(
+            RunRow.status.in_(("pending", "running")),
+            RunRow.created_at <= accepted_before,
+        )
+        candidates = list((await conn.session.execute(q)).scalars())
+        sm = get_stream_manager()
+        now = datetime.now(UTC)
+        if candidates:
+            await _cancel_candidates_loop(conn.session, candidates, "interrupt", sm, now, reason)
+            await conn.session.flush()
+        remaining = list(
+            (
+                await conn.session.execute(
+                    sa_select(RunRow).where(
+                        RunRow.status.in_(("pending", "running")),
+                        RunRow.created_at <= accepted_before,
+                    )
+                )
+            ).scalars()
+        )
+        finishing = sum(1 for run in remaining if run.cancel_reason)
+        return {
+            "not_yet_reached": len(remaining) - finishing,
+            "finishing": finishing,
+        }
 
     @staticmethod
     async def search(
@@ -3308,6 +3525,26 @@ class Runs(Authenticated):
         return None
 
     @staticmethod
+    async def requeue(conn: PgConnectionProto, run_id: UUID | str, reason: str = "") -> None:
+        """Put a drained run back on the queue without consuming a retry.
+
+        The claim that is draining already incremented the retry counter.
+        Giving that increment back keeps a drain from counting as a failure.
+        """
+        run_id = _ensure_uuid(run_id)
+        run = await _aget_run(conn.session, run_id)
+        if run is None or run.status not in ("running", "pending"):
+            return
+        counter = await conn.session.get(RetryCounterRow, run_id)
+        if counter is not None and counter.count > 0:
+            counter.count -= 1
+        run.status = "pending"
+        run.updated_at = datetime.now(UTC)
+        await conn.session.flush()
+        conn.schedule_after_commit(wake_run_queue)
+        await logger.ainfo("Re-queued drained run", run_id=str(run_id), reason=reason)
+
+    @staticmethod
     async def next(wait: bool = False, limit: int = 1) -> AsyncIterator:
         """Claim pending runs via FOR UPDATE SKIP LOCKED (multi-replica safe)."""
         from sqlalchemy.exc import IntegrityError
@@ -3337,7 +3574,14 @@ class Runs(Authenticated):
                     conflict_budget -= 1
                     continue
                 claimed += 1
-                yield (run_dict, attempt)
+                from langgraph_runtime_pg.encryption import extract_blob_encryption_context
+
+                encryption_context = extract_blob_encryption_context(
+                    (run_dict.get("kwargs") or {}).get("config")
+                    if isinstance(run_dict.get("kwargs"), dict)
+                    else None
+                )
+                yield (run_dict, attempt, encryption_context)
             except IntegrityError:
                 if run_id is not None:
                     await clear_run_heartbeat(run_id)
@@ -3610,6 +3854,7 @@ def _apply_cron_updates(
     cron_id,
     croniter_mod,
     next_cron_date,
+    clear_end_time: bool = False,
 ):
     """Mutate cron row fields in place."""
     if timezone is not None:
@@ -3621,7 +3866,9 @@ def _apply_cron_updates(
         row.next_run_date = next_cron_date(schedule, datetime.now(UTC), timezone=row.timezone)
     elif timezone is not None:
         row.next_run_date = next_cron_date(row.schedule, datetime.now(UTC), timezone=timezone)
-    if end_time is not None:
+    if clear_end_time:
+        row.end_time = None
+    elif end_time is not None:
         row.end_time = end_time
     if enabled is not None:
         row.enabled = enabled
@@ -3738,6 +3985,7 @@ class Crons(Authenticated):
         cron_id: UUID,
         schedule: str | None = None,
         end_time: datetime | None = None,
+        clear_end_time: bool = False,
         enabled: bool | None = None,
         on_run_completed: str | None = None,
         payload: dict | None = None,
@@ -3749,7 +3997,7 @@ class Crons(Authenticated):
         from langgraph_api.utils import next_cron_date
         from langgraph_sdk import Auth
 
-        has_updates = any(
+        has_updates = clear_end_time or any(
             v is not None
             for v in [schedule, end_time, enabled, on_run_completed, payload, metadata, timezone]
         )
@@ -3778,6 +4026,7 @@ class Crons(Authenticated):
             cron_id,
             croniter_mod,
             next_cron_date,
+            clear_end_time=clear_end_time,
         )
 
         row.updated_at = datetime.now(UTC)
@@ -3969,33 +4218,36 @@ async def listen_for_cancellation(
 
     stream_manager = get_stream_manager()
 
+    def _apply_control(message: Message) -> bool:
+        reason = message.reason
+        if message.data == b"rollback":
+            done.set(UserRollback(reason) if reason else UserRollback())
+        elif message.data == b"interrupt":
+            done.set(UserInterrupt(reason) if reason else UserInterrupt())
+        elif message.data == b"done":
+            done.set()
+            return True
+        return False
+
     # Hydrate from Redis so a cancel published before this worker subscribed is still observed.
     if control_key := await stream_manager.aget_control_key(run_id, thread_id):
-        payload = control_key.data
-        if payload == b"rollback":
-            done.set(UserRollback())
-        elif payload == b"interrupt":
-            done.set(UserInterrupt())
+        _apply_control(control_key)
 
     while not done.is_set():
         try:
             # Do not break on timeout — long runs stay quiet until interrupt/rollback/done.
             message = await asyncio.wait_for(queue.get(), timeout=240)
-            payload = message.data
-            if payload == b"rollback":
-                done.set(UserRollback())
-            elif payload == b"interrupt":
-                done.set(UserInterrupt())
-            elif payload == b"done":
-                done.set()
+            if _apply_control(message):
                 break
         except TimeoutError:
             continue
 
 
-async def cancel_run(thread_id: UUID, run_id: UUID, ctx: Any = None) -> None:
+async def cancel_run(
+    thread_id: UUID, run_id: UUID, ctx: Any = None, reason: str | None = None
+) -> None:
     async with connect() as conn:
-        await Runs.cancel(conn, [run_id], thread_id=thread_id, ctx=ctx)
+        await Runs.cancel(conn, [run_id], thread_id=thread_id, ctx=ctx, reason=reason)
 
 
 __all__ = [

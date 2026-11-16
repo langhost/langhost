@@ -168,6 +168,7 @@ jobs:
           uv run --no-build --no-sync pytest \
             libs/langgraph-runtime-pg/tests/test_interface.py \
             libs/langgraph-runtime-pg/tests/test_queue.py \
+            libs/langgraph-runtime-pg/tests/test_api_018.py \
             libs/langhost/tests \
             -o "timeout=30"  # NOSONAR — pytest from locked env
 

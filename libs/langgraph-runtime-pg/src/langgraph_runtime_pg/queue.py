@@ -244,21 +244,21 @@ async def _claim_and_dispatch(
     from langgraph_api import config, graph, worker
 
     claimed = last_run
-    async for run, attempt in ops.Runs.next(wait=False, limit=runners.qsize()):
+    async for run, attempt, encryption_context in ops.Runs.next(wait=False, limit=runners.qsize()):
         claimed = run
         runner = runners.get_nowait()
         graph_id = run["kwargs"].get("config", {}).get("configurable", {}).get("graph_id")
         task_name = f"run-{run['run_id']}-attempt-{attempt}"
         if not config.BG_JOB_ISOLATED_LOOPS or (graph_id and graph.is_js_graph(graph_id)):
             task = asyncio.create_task(
-                worker.worker(run, attempt, loop),
+                worker.worker(run, attempt, loop, encryption_context=encryption_context),
                 name=task_name,
             )
             task.add_done_callback(functools.partial(cleanup, runner=runner))
             _workers_add(task)
         else:
             runner.submit(
-                worker.worker(run, attempt, loop),
+                worker.worker(run, attempt, loop, encryption_context=encryption_context),
                 name=task_name,
                 callback=functools.partial(cleanup, runner=runner),
             )

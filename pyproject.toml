@@ -33,7 +33,7 @@ ci = [
     # Dependencies imported by the upstream SDK integration graphs.
     # Transitive adapters remain reproducible through the frozen uv.lock.
     "deepagents==0.7.11",
-    "langchain==1.3.18",
+    "langchain==1.5.0",
 ]
 
 [tool.uv.workspace]
@@ -46,12 +46,15 @@ langhost = { workspace = true }
 # Keep the whole resolver on the frozen upstream set (incl. transitive pulls).
 [tool.uv]
 constraint-dependencies = [
-    "langgraph-api==0.11.1",
-    "langgraph-runtime-inmem==0.31.1",
-    "langgraph-sdk==0.4.4",
-    "langgraph==1.2.11",
-    "langgraph-checkpoint==4.1.1",
-    "langgraph-checkpoint-postgres==3.1.0",
+    # Frozen to the langgraph-api 0.18.1 release set. Exact pins (not ranges)
+    # keep the Agent Server, its in-memory reference runtime, and the graph
+    # stack that the interface tests import on one known revision.
+    "langgraph-api==0.18.1",
+    "langgraph-runtime-inmem==0.38.1",
+    "langgraph-sdk==0.4.14",
+    "langgraph==1.2.22",
+    "langgraph-checkpoint==4.3.2",
+    "langgraph-checkpoint-postgres==3.2.1",
 ]
 package = false
 

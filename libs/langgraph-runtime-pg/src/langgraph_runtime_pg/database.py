@@ -218,6 +218,9 @@ _RUN_KEYS = [
     "metadata",
     "kwargs",
     "multitask_strategy",
+    "langsmith_session_name",
+    "cancel_reason",
+    "priority",
     "created_at",
     "updated_at",
 ]
@@ -474,9 +477,27 @@ async def connect(
 
 
 async def healthcheck(*, check_db: bool = True) -> None:
-    if check_db and _ENGINE is not None:
-        async with _ENGINE.connect() as conn:
-            await conn.execute(text("SELECT 1"))
+    if not check_db:
+        return
+    if _ENGINE is None:
+        raise RuntimeError("Postgres pool is not started")
+    async with _ENGINE.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+
+
+async def _redis_healthcheck() -> None:
+    from langgraph_runtime_pg.redis_stream import ping_redis
+
+    await ping_redis()
+
+
+def dependency_checks() -> dict[str, Any]:
+    """Probes ``/ok?check_db=1`` runs for Postgres and Redis."""
+
+    async def postgres() -> None:
+        await healthcheck(check_db=True)
+
+    return {"postgres": postgres, "redis": _redis_healthcheck}
 
 
 def pool_stats(*args: Any, **kwargs: Any) -> dict[str, dict[str, int]]:

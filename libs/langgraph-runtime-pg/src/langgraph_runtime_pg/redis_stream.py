@@ -248,6 +248,32 @@ class Message:
     topic: bytes
     data: bytes
     id: bytes | None = None
+    # Set on cancel control messages so the worker can raise UserInterrupt(reason).
+    reason: str | None = None
+
+
+def _encode_control_payload(message: Message) -> bytes:
+    """Persist a control action. Legacy values are the raw action bytes."""
+    if message.reason is None:
+        return message.data
+    action = message.data.decode() if isinstance(message.data, bytes) else str(message.data)
+    return orjson.dumps({"action": action, "reason": message.reason})
+
+
+def _message_from_control_payload(run_id: UUID, payload: bytes) -> Message:
+    topic = f"run:{run_id}:control".encode()
+    if payload[:1] == b"{":
+        try:
+            obj = orjson.loads(payload)
+        except orjson.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("action"), str):
+            return Message(
+                topic=topic,
+                data=obj["action"].encode(),
+                reason=obj.get("reason") if isinstance(obj.get("reason"), str) else None,
+            )
+    return Message(topic=topic, data=payload)
 
 
 class ContextQueue(asyncio.Queue):
@@ -265,14 +291,15 @@ class ContextQueue(asyncio.Queue):
 def _encode_envelope(message: Message, *, control: bool = False) -> bytes:
     topic = message.topic.decode() if isinstance(message.topic, bytes) else message.topic
     mid = message.id.decode() if isinstance(message.id, bytes) else (message.id or "")
-    return orjson.dumps(
-        {
-            "topic": topic,
-            "data": base64.b64encode(message.data).decode("ascii"),
-            "id": mid,
-            "control": control,
-        }
-    )
+    body: dict[str, Any] = {
+        "topic": topic,
+        "data": base64.b64encode(message.data).decode("ascii"),
+        "id": mid,
+        "control": control,
+    }
+    if message.reason is not None:
+        body["reason"] = message.reason
+    return orjson.dumps(body)
 
 
 def _decode_envelope(payload: bytes | str) -> Message | None:
@@ -283,7 +310,13 @@ def _decode_envelope(payload: bytes | str) -> Message | None:
         data = base64.b64decode(obj["data"])
         mid = obj.get("id") or ""
         mid_b = mid.encode() if isinstance(mid, str) else mid
-        return Message(topic=topic, data=data, id=mid_b or None)
+        reason = obj.get("reason")
+        return Message(
+            topic=topic,
+            data=data,
+            id=mid_b or None,
+            reason=reason if isinstance(reason, str) else None,
+        )
     except Exception:
         logger.exception("Failed to decode fanout envelope")
         return None
@@ -384,7 +417,7 @@ class StreamManager:
         if data is None:
             return None
         payload = data if isinstance(data, (bytes, bytearray)) else str(data).encode()
-        message = Message(topic=f"run:{run_id}:control".encode(), data=bytes(payload))
+        message = _message_from_control_payload(run_id, bytes(payload))
         self.control_keys[thread_id][run_id] = message
         return message
 
@@ -537,7 +570,7 @@ class StreamManager:
             # TTL: pending cancels that never enter Runs.enter must not leak keys.
             await self._redis.set(
                 _control_key(thread_id, run_id),
-                message.data,
+                _encode_control_payload(message),
                 ex=max(_heartbeat_ttl_secs() * 4, 3600),
             )
 
@@ -829,6 +862,14 @@ async def _wake_listener_loop() -> None:
                 await pubsub.aclose()
             except Exception:
                 pass
+
+
+async def ping_redis() -> None:
+    """Raise if the runtime Redis client is missing or unreachable."""
+    client = None if stream_manager is None else stream_manager._redis
+    if client is None:
+        raise RuntimeError("Redis is not connected")
+    await client.ping()
 
 
 async def start_stream() -> None:

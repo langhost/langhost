@@ -65,8 +65,8 @@ Both packages ship in **lockstep** (`langhost` and `langgraph-runtime-pg` share 
 4. Tag and push (tag must match the version, with a `v` prefix):
 
    ```bash
-   git tag v0.11.1.post4
-   git push origin v0.11.1.post4
+   git tag v0.18.1.post1
+   git push origin v0.18.1.post1
    ```
 
 5. The **Release** workflow builds, publishes both packages to **PyPI** (Trusted Publishing / OIDC), and creates a GitHub Release.
@@ -79,4 +79,3 @@ Both packages ship in **lockstep** (`langhost` and `langgraph-runtime-pg` share 
   - `langgraph-runtime-pg` → environment `pypi-runtime`
 - Protect `main`: require the **Lint**, **Build**, and **Test** status checks before merge.
 - The Release workflow runs the full CI suite first; each package publishes only after CI is green and its environment is approved.
-

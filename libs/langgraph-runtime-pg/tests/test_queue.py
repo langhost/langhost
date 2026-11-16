@@ -70,7 +70,8 @@ async def test_exactly_one_claim(pg_runtime):
 
     async def claim_one():
         return [
-            (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+            (run["run_id"], attempt)
+            async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
         ]
 
     winners = [
@@ -122,7 +123,8 @@ async def test_one_running_per_thread_under_concurrent_claim(pg_runtime):
 
     async def claim_one():
         return [
-            (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+            (run["run_id"], attempt)
+            async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
         ]
 
     winners = [
@@ -161,7 +163,8 @@ async def test_stale_heartbeat_reclaim(pg_runtime):
         assert run["status"] == "pending"
 
     reclaimed = [
-        (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+        (run["run_id"], attempt)
+        async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
     ]
     assert len(reclaimed) == 1
     assert reclaimed[0] == (rid, 2)
@@ -279,7 +282,8 @@ async def test_cancel_running_blocks_next_claim_while_heartbeat_alive(pg_runtime
         await ops.Runs.cancel(conn, [first["run_id"]], thread_id=tid, action="interrupt")
 
     claimed = [
-        (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+        (run["run_id"], attempt)
+        async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
     ]
     assert claimed == [], (
         f"second run claimed while cancelled worker heartbeat still live: {claimed}; "
@@ -296,7 +300,8 @@ async def test_cancel_running_blocks_next_claim_while_heartbeat_alive(pg_runtime
 
     await clear_run_heartbeat(first["run_id"])
     claimed_after = [
-        (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+        (run["run_id"], attempt)
+        async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
     ]
     assert claimed_after == [(second["run_id"], 1)]
 
@@ -424,7 +429,8 @@ async def test_next_ignores_heartbeat_on_terminal_sibling(pg_runtime):
     await set_run_heartbeat(first["run_id"], ttl=60)
 
     claimed = [
-        (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+        (run["run_id"], attempt)
+        async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
     ]
     assert claimed == [(second["run_id"], 1)], (
         f"pending run blocked by stale heartbeat on terminal sibling "
@@ -477,7 +483,8 @@ async def test_next_treats_unknown_heartbeat_as_blocking(pg_runtime, monkeypatch
     monkeypatch.setattr(ops, "has_run_heartbeat", _unknown)
 
     claimed = [
-        (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+        (run["run_id"], attempt)
+        async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
     ]
     assert claimed == [], (
         f"second run claimed while heartbeat check returned None (unknown): {claimed}; "
@@ -811,7 +818,8 @@ async def test_fake_death_queue_reclaims_and_finishes(api_lifespan_no_queue, mon
         tid_uuid = uuid.UUID(tid)
 
     claimed = [
-        (run["run_id"], attempt) async for run, attempt in ops.Runs.next(wait=False, limit=1)
+        (run["run_id"], attempt)
+        async for run, attempt, _encryption_context in ops.Runs.next(wait=False, limit=1)
     ]
     assert len(claimed) == 1 and claimed[0] == (rid, 1)
 
