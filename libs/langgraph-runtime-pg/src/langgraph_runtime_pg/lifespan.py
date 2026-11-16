@@ -171,6 +171,18 @@ async def lifespan(
                 _LAST_LIFESPAN_ERROR = exc
                 await _log_graph_load_failure(exc)
                 raise
+            try:
+                from langgraph_api.priority_settings import get_priority_callback
+            except ImportError:
+                # Older langgraph-api builds have no priority callback.
+                pass
+            else:
+                # Import now so a bad callback path fails startup, not the first run.
+                if get_priority_callback() is not None:
+                    await logger.awarning(
+                        "A run-priority callback is configured, but this Postgres "
+                        "runtime still claims runs in creation order"
+                    )
             if config.N_JOBS_PER_WORKER > 0:
                 tg.create_task(queue_with_signal())
 

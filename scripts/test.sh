@@ -107,7 +107,7 @@ echo "    at $(git -C "${UPSTREAM_DIR}" rev-parse --short HEAD)"
 echo "==> install upstream sdk-py (editable)"
 # Editable local path may require a build; pinned deps use --no-build.
 UV_NO_BUILD=0 uv pip install --quiet -e "${UPSTREAM_DIR}/libs/sdk-py" # NOSONAR
-uv pip install --quiet --no-build "deepagents==0.6.12" "langchain==1.3.14"
+uv pip install --quiet --no-build "deepagents==0.7.11" "langchain==1.5.0"
 
 INTEGRATION_DIR="${UPSTREAM_DIR}/libs/sdk-py/integration"
 export N_JOBS_PER_WORKER="${N_JOBS_PER_WORKER:-2}"
@@ -128,6 +128,7 @@ echo "==> tests (wall-clock budget ${E2E_DEADLINE_SECS}s for pytest+server+SDK)"
   uv run pytest -q \
     libs/langgraph-runtime-pg/tests/test_interface.py \
     libs/langgraph-runtime-pg/tests/test_queue.py \
+    libs/langgraph-runtime-pg/tests/test_api_018.py \
     libs/langhost/tests \
     --tb=short
 

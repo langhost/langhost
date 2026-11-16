@@ -129,6 +129,13 @@ class RunRow(Base):
     )
     kwargs: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=_JSONB_EMPTY)
     multitask_strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Server-generated. Null until a cancel records why the run stopped.
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    langsmith_session_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Queue priority is stored for API parity. Claims stay creation-order.
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=_NOW
     )

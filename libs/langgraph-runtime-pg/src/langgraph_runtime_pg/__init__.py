@@ -5,6 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 from langgraph_runtime_pg import (
     checkpoint,
     database,
+    encryption,
     lifespan,
     metrics,
     migrate,
@@ -25,6 +26,7 @@ __all__ = [
     "__version__",
     "checkpoint",
     "database",
+    "encryption",
     "lifespan",
     "metrics",
     "migrate",

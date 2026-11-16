@@ -89,7 +89,7 @@ Official [`langgraph dev`](https://docs.langchain.com/oss/python/langgraph/local
             langhost serve          ← this CLI (MIT)
                  │
                  ▼
-           langgraph-api            ← stock Agent Server (unchanged)
+           langgraph-api 0.18.1    ← stock Agent Server (unchanged)
                  │
                  ▼
       langgraph-runtime-pg          ← open Postgres + Redis runtime (MIT)
